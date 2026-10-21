@@ -20,6 +20,8 @@ async def serve(context, tracked_only=False):
     allow = tracked_files() if tracked_only else None
 
     async def handle(route):
+        if route.request.method == 'HEAD':   # 模拟魔搭创空间的网关：HEAD 请求一律 403
+            return await route.fulfill(status=403, body='', headers=CORS)
         path = urllib.parse.unquote(urllib.parse.urlsplit(route.request.url).path).lstrip('/') or 'index.html'
         f = (ROOT / path).resolve()
         ok = not path.startswith('api/') and f.is_file() and ROOT in f.parents and (allow is None or path in allow)

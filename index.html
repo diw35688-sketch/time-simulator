@@ -334,21 +334,28 @@ async function startCamera() {
   }
   try {
     handStatus = '加载手势模型';
-    // 优先用本地 vendor（python download_models.py 下载），没有再走 CDN
-    const local = (await fetch('vendor/mediapipe/hand_landmarker.task', { method: 'HEAD' }).catch(() => null))?.ok;
-    const base = local ? new URL('vendor/mediapipe/', location.href).href : 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/';
-    const model = local ? base + 'hand_landmarker.task' : 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
-    handStatus = local ? '加载本地模型' : '从 CDN 加载模型';
-    if (!local) setTimeout(() => { if (!landmarker) banner('手势模型从 CDN 加载很慢（国内常见）。请运行 python download_models.py 下载到本地后刷新；现在可先用鼠标 + 滚轮。'); }, 15000);
-    const { FilesetResolver, HandLandmarker, PoseLandmarker } = await import(base + 'vision_bundle.mjs');
+    // 优先用本地 vendor（python download_models.py 下载），没有再走 CDN。
+    // 不用 HEAD 请求探测：魔搭创空间的网关会把 HEAD 一律拒掉
+    const LOCAL = new URL('vendor/mediapipe/', location.href).href, CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/';
+    let base = LOCAL, mp;
+    handStatus = '加载本地模型';
+    try { mp = await import(LOCAL + 'vision_bundle.mjs'); }
+    catch (e) {
+      base = CDN; handStatus = '从 CDN 加载模型';
+      setTimeout(() => { if (!landmarker) banner('手势模型从 CDN 加载很慢（国内常见）。请运行 python download_models.py 下载到本地后刷新；现在可先用鼠标 + 滚轮。'); }, 15000);
+      mp = await import(CDN + 'vision_bundle.mjs');
+    }
+    const local = base === LOCAL;
+    const model = local ? LOCAL + 'hand_landmarker.task' : 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+    const { FilesetResolver, HandLandmarker, PoseLandmarker } = mp;
     const fs = await FilesetResolver.forVisionTasks(base + 'wasm');
     const opts = delegate => ({
       baseOptions: { modelAssetPath: model, delegate },
       runningMode: 'VIDEO', numHands: 2, minHandDetectionConfidence: .5, minHandPresenceConfidence: .5, minTrackingConfidence: .5 });
     try { landmarker = await HandLandmarker.createFromOptions(fs, opts('GPU')); handStatus = '就绪 GPU'; }
     catch (e) { console.warn('GPU 失败，改用 CPU', e); landmarker = await HandLandmarker.createFromOptions(fs, opts('CPU')); handStatus = '就绪 CPU'; }
-    // 手臂：有本地姿态模型就追踪手肘，没有就按手的方向估算前臂
-    if (local && (await fetch(base + 'pose_landmarker_lite.task', { method: 'HEAD' }).catch(() => null))?.ok) {
+    // 手臂：有本地姿态模型就追踪手肘，没有（或加载失败）就按手的方向估算前臂
+    if (local) {
       try {
         poser = await PoseLandmarker.createFromOptions(fs, { baseOptions: { modelAssetPath: base + 'pose_landmarker_lite.task', delegate: 'GPU' }, runningMode: 'VIDEO', numPoses: 1 });
         handStatus += ' + 手臂';
@@ -506,12 +513,16 @@ function initAudio() {
   const ng = ctx.createGain(); ng.gain.value = .12; n.connect(bp).connect(ng).connect(audio.hum); n.start();
   audio.on = true;
   soundEl.textContent = '声音开';
-  // 看看本机有没有放背景乐文件，合成氛围音永远排在最后
-  Promise.all(BGM_FILES.map(u => fetch(u, { method: 'HEAD' }).then(r => r.ok, () => false))).then(ok => {
-    audio.tracks = [...BGM_FILES.filter((_, i) => ok[i]), 'pad'];
-    audio.track = Math.min(+(params.get('bgm') || 0) || 0, audio.tracks.length - 1);
+  // 直接试着播背景乐文件，放不了（不存在或格式不支持）就从列表里去掉；合成氛围音永远排在最后
+  audio.tracks = [...BGM_FILES, 'pad'];
+  audio.el.addEventListener('error', () => {
+    if (audio.tracks[audio.track] === 'pad') return;
+    audio.tracks.splice(audio.track, 1);
+    audio.track = Math.min(audio.track, audio.tracks.length - 1);
     playTrack();
   });
+  audio.track = Math.min(+(params.get('bgm') || 0) || 0, audio.tracks.length - 1);
+  playTrack();
 }
 function sfxSummon() {
   const ctx = audio.ctx, t0 = ctx.currentTime;

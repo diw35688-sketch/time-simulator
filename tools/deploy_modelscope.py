@@ -16,6 +16,8 @@ MODEL_FILES = ['vision_bundle.mjs', 'wasm/vision_wasm_internal.js', 'wasm/vision
 # 魔搭在国内直连更稳，走代理反而握手失败
 ENV = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
 ENV['NO_PROXY'] = 'modelscope.cn,.modelscope.cn,' + os.environ.get('NO_PROXY', '')
+# 创空间页面上的卡片信息，放在 README 开头（格式见 https://modelscope.cn/docs/创空间卡片）
+CARD = chr(10).join(['---', 'domain:', '  - cv', 'tags:', '  - 手势识别', '  - MediaPipe', '  - three.js', '  - 创意编程', '  - AI生成', 'license: mit', '---', '', ''])
 
 
 def tokens():
@@ -28,7 +30,7 @@ def tokens():
     return api_token, git_token or api_token
 
 
-def run(cmd, cwd=None, secret=None):
+def run(cmd, cwd=None, secret=None, check=True):
     shown = ' '.join(cmd if not secret else [c.replace(secret, '***') for c in cmd])
     print('$', shown[:200])
     r = subprocess.run(cmd, cwd=cwd, env=ENV, capture_output=True, text=True, encoding='utf8', errors='replace')
@@ -38,8 +40,17 @@ def run(cmd, cwd=None, secret=None):
     if out:
         print(out[-3000:])
     if r.returncode:
+        if not check:
+            return None
         sys.exit('命令失败，退出码 ' + str(r.returncode))
     return out
+
+
+def rmtree(path):
+    def unlock(func, p, _):
+        os.chmod(p, 0o700)   # Windows 上 .git 里的对象文件是只读的
+        func(p)
+    shutil.rmtree(path, onerror=unlock)
 
 
 def assemble(dest):
@@ -82,21 +93,39 @@ def main():
          '--description', '张开手掌召唤法阵，转动手腕拨动物品的时间；一句话用 AI 生成新的 3D 时间物品'], secret=api_token)
     tmp = pathlib.Path(tempfile.mkdtemp(prefix='timesim-deploy-'))
     try:
+        auth = base64.b64encode(('oauth2:' + git_token).encode()).decode()
+        net = ['git', '-c', 'http.proxy=', '-c', 'http.extraHeader=Authorization: Basic ' + auth]
+        url = 'https://www.modelscope.cn/studios/' + a.repo_id + '.git'
+        run(['git', 'init', '-q', '-b', 'master'], cwd=tmp)
+        # master 是受保护分支，不能强推：先取回线上已有的提交，在它后面接着提交
+        remote_attrs = ''
+        if run(net + ['fetch', '-q', url, 'master'], cwd=tmp, secret=auth, check=False) is not None:
+            run(['git', 'checkout', '-q', '-B', 'master', 'FETCH_HEAD'], cwd=tmp)
+            attrs = tmp / '.gitattributes'
+            remote_attrs = attrs.read_text(encoding='utf8') if attrs.exists() else ''
+            for item in tmp.iterdir():
+                if item.name != '.git':
+                    rmtree(item) if item.is_dir() else item.unlink()
         manifest = assemble(tmp)
         print('拆分的大文件：', {k: v['parts'] for k, v in manifest.items()})
-        auth = base64.b64encode(('oauth2:' + git_token).encode()).decode()
-        git = ['git', '-c', 'http.proxy=', '-c', 'http.extraHeader=Authorization: Basic ' + auth]
-        run(['git', 'init', '-q', '-b', 'master'], cwd=tmp)
+        readme = tmp / 'README.md'
+        readme.write_text(CARD + readme.read_text(encoding='utf8'), encoding='utf8')
+        if remote_attrs:   # 保留平台默认的 LFS 规则，后面接上本项目的
+            ours = tmp / '.gitattributes'
+            ours.write_text(remote_attrs.rstrip() + chr(10) + (ours.read_text(encoding='utf8') if ours.exists() else ''), encoding='utf8')
         run(['git', 'add', '-A'], cwd=tmp)
-        run(['git', '-c', 'core.autocrlf=false', 'commit', '-q', '-m', 'deploy ' + sha], cwd=tmp)
-        url = 'https://www.modelscope.cn/studios/' + a.repo_id + '.git'
-        run(git + ['push', '--force', url, 'master:master'], cwd=tmp, secret=auth)
+        run(['git', 'add', '-f', 'vendor/mediapipe'], cwd=tmp)   # 项目的 .gitignore 排除了这个目录，这里要强制加上
+        if not run(['git', 'status', '--porcelain'], cwd=tmp):
+            print('线上已经是这个版本，不用推送')
+        else:
+            run(['git', '-c', 'core.autocrlf=false', 'commit', '-q', '-m', 'deploy ' + sha], cwd=tmp)
+            run(net + ['push', url, 'master:master'], cwd=tmp, secret=auth)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        rmtree(tmp)
     if not a.no_deploy:
-        run(['modelscope', '--token', api_token, 'studio', 'deploy', a.repo_id], secret=api_token)
+        run(['modelscope', '--token', api_token, 'deploy', a.repo_id, '--repo-type', 'studio'], secret=api_token)
     print('创空间：https://www.modelscope.cn/studios/' + a.repo_id)
-    print('看构建日志：modelscope studio logs ' + a.repo_id + ' --type build')
+    print('看构建日志：modelscope logs ' + a.repo_id + ' --repo-type studio --log-type build')
 
 
 if __name__ == '__main__':
