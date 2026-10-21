@@ -2,6 +2,8 @@
 
 张开手掌召唤法阵，转动手腕，让物品在时间里前进或倒流：苹果从开花到成熟、被咬、腐烂，再倒回去。
 
+**在线体验**：[魔搭创空间 · 时间模拟器](https://www.modelscope.cn/studios/c8iolab/time-simulator)，打开后允许摄像头就能玩（用 AI 生成物品需要你自己的 Key）。
+
 <p align="center"><img src="docs/demo.gif" width="640" alt="法阵锁定苹果后拨动时间：成熟 → 干瘪塌陷 → 苹果花 → 成熟"></p>
 
 全部在浏览器里运行：MediaPipe 识别手和手臂，three.js 渲染法阵和 3D 物品。物品不是写死的：在设置面板里填上 DeepSeek（或任何兼容 OpenAI 格式的接口）的 Key，写一句话，就能生成一个新的 3D 时间物品。
@@ -151,4 +153,4 @@ vendor/                 three.js r160、acorn
 
 **Time Simulator**: open your palm to summon a glowing circle, then twist your wrist to scrub an object through time. An apple blossoms, ripens, gets bitten, rots, and rewinds. Everything runs in the browser (MediaPipe hand and pose tracking, three.js). Each object is a standalone HTML page driven by a tiny postMessage protocol, and you can generate new ones from a one-line description with any OpenAI-compatible API such as DeepSeek.
 
-Quick start: `python download_models.py && python server.py`, then open <http://127.0.0.1:8765/>. MIT licensed. A fan project inspired by *Doctor Strange* (2016); not affiliated with Marvel or Disney.
+Live demo: https://www.modelscope.cn/studios/c8iolab/time-simulator . Quick start: `python download_models.py && python server.py`, then open <http://127.0.0.1:8765/>. MIT licensed. A fan project inspired by *Doctor Strange* (2016); not affiliated with Marvel or Disney.
