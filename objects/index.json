@@ -1,0 +1,26 @@
+[
+ {
+  "id": "apple3d",
+  "name": "3D 苹果",
+  "src": "objects/apple3d.html",
+  "model": "deepseek-v4.1-flash-1017",
+  "prompt": "一个红苹果（带短梗和一片叶子）。过去可以是：苹果花 → 花谢结出青涩小果 → 渐渐长大变红；未来可以是：被咬一口 → 切面褐变、果皮起皱 → 长出霉斑 → 干瘪塌陷",
+  "note": "人工修复 1 处：漏了 document.body.appendChild(renderer.domElement)"
+ },
+ {
+  "id": "candle",
+  "name": "白蜡烛",
+  "src": "objects/candle.html",
+  "model": "deepseek-v4.1-flash-1017",
+  "prompt": "一根点燃的白蜡烛。过去：蜂巢 → 蜡块 → 崭新未点燃的蜡烛；未来：越烧越短 → 蜡泪堆积 → 熄灭冒烟 → 只剩一滩蜡",
+  "note": "人工修复 1 处：PointLight 的颜色参数里混进了乱码"
+ },
+ {
+  "id": "apple2d",
+  "name": "苹果（平面图片版）",
+  "src": "objects/apple2d.html",
+  "model": "deepseek-v4.1-flash-1017",
+  "prompt": "任务书见 prompts/apple2d_task.md；素材 assets/apple.png 由 seedream-5.0-lite 生成",
+  "note": "人工修复 1 处：smoothstep 的截断范围写错，现在时刻也开着花"
+ }
+]

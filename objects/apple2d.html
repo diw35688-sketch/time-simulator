@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Apple Time</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: transparent;
+  }
+  body.standalone {
+    background: radial-gradient(circle at 50% 42%, #18202c 0%, #0a0d13 58%, #05070a 100%);
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #ui {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 16px 0 26px;
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    pointer-events: none;
+    user-select: none;
+  }
+  #stage {
+    font-size: 15px; letter-spacing: .2em; color: #cdd7e6;
+    text-shadow: 0 1px 10px rgba(0,0,0,.85);
+    opacity: .92;
+  }
+  #slider {
+    pointer-events: auto;
+    -webkit-appearance: none; appearance: none;
+    width: min(540px, 76vw); height: 4px; border-radius: 2px;
+    background: linear-gradient(90deg, #4f8a63 0%, #8b93a2 50%, #7d4b32 100%);
+    outline: none; cursor: pointer;
+  }
+  #slider::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%;
+    background: #eef3fb; border: 1px solid #90a2ba; cursor: pointer;
+    box-shadow: 0 0 10px rgba(150,195,255,.55);
+  }
+  #slider::-moz-range-thumb {
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #eef3fb; border: 1px solid #90a2ba; cursor: pointer;
+  }
+  #hint {
+    font-size: 11px; letter-spacing: .12em; color: #6f7e93; opacity: .75;
+  }
+  body.embed #ui { display: none; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div id="stage">现在</div>
+  <input id="slider" type="range" min="-1" max="1" step="0.001" value="0">
+  <div id="hint">← → 微调</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ======================= 模式 ======================= */
+const params = new URLSearchParams(location.search);
+const EMBED = params.get('embed') === '1';
+document.body.classList.add(EMBED ? 'embed' : 'standalone');
+
+/* ======================= 基础 ======================= */
+const renderer = new THREE.WebGLRenderer({
+  antialias: true,
+  alpha: true,
+  premultipliedAlpha: false,
+  powerPreference: 'high-performance'
+});
+renderer.setClearColor(0x000000, 0);
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
+renderer.domElement.style.position = 'fixed';
+renderer.domElement.style.inset = '0';
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10, 10);
+camera.position.set(0, 0, 1);
+
+/* ======================= 噪声（固定种子，纯函数） ======================= */
+const NOISE = /* glsl */`
+float hash21(vec2 p){
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+float vnoise(vec2 p){
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+float fbm2(vec2 p){
+  float v = 0.0;
+  float amp = 0.5;
+  for(int i = 0; i < 3; i++){
+    v += amp * vnoise(p);
+    p = p * 2.07 + vec2(11.7, 5.3);
+    amp *= 0.5;
+  }
+  return v * 1.142857;
+}
+`;
+
+/* ======================= 苹果：顶点着色器 ======================= */
+const APPLE_VERT = /* glsl */`
+uniform float uT;
+varying vec2 vUv;
+
+${NOISE}
+
+void main(){
+  vUv = uv;
+  vec3 p = position;
+
+  float past = clamp(-uT, 0.0, 1.0);
+  float fut  = clamp( uT, 0.0, 1.0);
+
+  /* 过去：青果逐渐缩小 */
+  float shrink = 1.0 - 0.55 * smoothstep(0.08, 0.60, past);
+  p.xy *= shrink;
+
+  /* 未来：起皱、干瘪、塌陷 */
+  float f2 = fut * fut;
+  float n1 = fbm2(uv * 3.6 + vec2(1.7, 9.2)) - 0.5;
+  float n2 = fbm2(uv * 3.6 + vec2(5.3, 2.1)) - 0.5;
+  p.x += n1 * 0.16 * f2;
+  p.y += n2 * 0.12 * f2;
+  p.y -= 0.13 * f2;
+  p.y *= 1.0 - 0.09 * f2;
+
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+}
+`;
+
+/* ======================= 苹果：片元着色器 ======================= */
+const APPLE_FRAG = /* glsl */`
+uniform sampler2D uMap;
+uniform float uT;
+uniform float uAspect;
+varying vec2 vUv;
+
+${NOISE}
+
+void main(){
+  vec4 tex = texture2D(uMap, vUv);
+  if (tex.a < 0.004) discard;
+
+  vec3 col = tex.rgb;
+  float alpha = tex.a;
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+
+  float past = clamp(-uT, 0.0, 1.0);
+  float fut  = clamp( uT, 0.0, 1.0);
+
+  /* ---------- 过去：青涩 ---------- */
+  float greenAmt = smoothstep(0.02, 0.42, past);
+  vec3 greenCol = vec3(0.47, 0.72, 0.30) * (0.32 + lum * 1.30);
+  col = mix(col, greenCol, greenAmt * 0.88);
+
+  /* ---------- 未来：咬痕 ---------- */
+  float rx = uAspect;
+  vec2 q = (vUv - 0.5) * vec2(uAspect, 1.0) * 2.0;
+
+  float d1 = length(q - vec2(rx * 0.90,  0.42));
+  float d2 = length(q - vec2(rx * 1.02,  0.02));
+  float d3 = length(q - vec2(rx * 0.88, -0.38));
+  float dist = min(min(d1, d2), d3);
+
+  // 咬痕边缘不规则
+  dist += (vnoise(vUv * 22.0) - 0.5) * 0.075 * smoothstep(0.0, 0.12, fut);
+
+  float biteR    = 0.50 * smoothstep(0.0, 0.36, fut);
+  float biteOut  = smoothstep(biteR - 0.004, biteR + 0.004, dist); // 1 = 保留
+  float biteEdge = 1.0 - smoothstep(biteR, biteR + 0.16, dist);
+
+  /* ---------- 未来：褐变 ---------- */
+  float bsp = fbm2(vUv * 5.0 + 13.0);
+  float brownAmt = smoothstep(0.10, 0.55, fut) * (0.40 + 0.60 * smoothstep(0.28, 0.72, bsp));
+  vec3 brownCol = vec3(0.40, 0.25, 0.12) * (0.50 + lum * 1.20);
+  col = mix(col, brownCol, clamp(brownAmt, 0.0, 1.0) * 0.92);
+
+  // 咬口边缘氧化发黑
+  float oxid = biteEdge * smoothstep(0.06, 0.30, fut);
+  col = mix(col, vec3(0.26, 0.15, 0.07) * (0.60 + lum * 0.90), oxid * 0.85);
+
+  /* ---------- 未来：霉斑 ---------- */
+  float mn = fbm2(vUv * 8.0 + 41.0);
+  float mold = smoothstep(0.54, 0.78, mn) * smoothstep(0.50, 0.88, fut);
+  vec3 moldCol = mix(vec3(0.22, 0.26, 0.16), vec3(0.80, 0.82, 0.74),
+                     smoothstep(0.54, 0.80, mn));
+  col = mix(col, moldCol, clamp(mold, 0.0, 1.0) * 0.90);
+
+  /* ---------- 未来：皱褶明暗 ---------- */
+  float wr = fbm2(vUv * 7.0 + 77.0);
+  col *= 1.0 - 0.22 * (wr - 0.5) * 2.0 * fut * fut;
+
+  /* ---------- 整体收暗 ---------- */
+  col *= 1.0 - 0.10 * fut * smoothstep(0.55, 1.0, fut);
+
+  /* ---------- Alpha ---------- */
+  alpha *= biteOut;
+  alpha *= 1.0 - smoothstep(0.62, 0.92, past);
+
+  if (alpha < 0.004) discard;
+
+  gl_FragColor = vec4(col, alpha);
+}
+`;
+
+/* ======================= 花：顶点 / 片元 ======================= */
+const FLOWER_VERT = /* glsl */`
+varying vec2 vUv;
+void main(){
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const FLOWER_FRAG = /* glsl */`
+uniform float uBloom;
+varying vec2 vUv;
+
+void main(){
+  vec2 p = (vUv - 0.5) * 2.0;
+  float r = length(p);
+  float a = atan(p.y, p.x);
+
+  float bloom = clamp(uBloom, 0.0, 1.0);
+  float grow  = smoothstep(0.0, 1.0, bloom);
+
+  /* 五瓣轮廓 */
+  float w = abs(cos(a * 2.5));
+  w = pow(w, 0.8);
+
+  float Rmax = mix(0.08, 0.94, grow);
+  float R = Rmax * (0.16 + 0.84 * w);
+
+  float edge = smoothstep(0.012, -0.012, r - R);
+  if (edge < 0.004) discard;
+
+  /* 花瓣配色 */
+  float tt = clamp(r / max(R, 1e-4), 0.0, 1.0);
+  vec3 petal = mix(vec3(1.00, 0.87, 0.92), vec3(1.00, 0.99, 0.99),
+                   smoothstep(0.05, 0.80, tt));
+  petal *= 0.86 + 0.18 * (1.0 - tt);
+  petal *= 0.94 + 0.06 * smoothstep(0.0, 0.5, w);
+
+  /* 花蕊 */
+  float cr = 0.20 * grow;
+  float core = smoothstep(cr, cr * 0.45, r);
+  vec3 coreCol = vec3(0.99, 0.84, 0.38);
+  vec3 col = mix(petal, coreCol, core);
+
+  float alpha = edge * smoothstep(0.0, 0.20, bloom);
+
+  if (alpha < 0.004) discard;
+  gl_FragColor = vec4(col, alpha);
+}
+`;
+
+/* ======================= 材质与网格 ======================= */
+const appleUniforms = {
+  uMap:    { value: null },
+  uT:      { value: 0 },
+  uAspect: { value: 1 }
+};
+
+const flowerUniforms = {
+  uBloom: { value: 0 }
+};
+
+const appleMat = new THREE.ShaderMaterial({
+  uniforms: appleUniforms,
+  vertexShader: APPLE_VERT,
+  fragmentShader: APPLE_FRAG,
+  transparent: true,
+  depthTest: false,
+  depthWrite: false,
+  side: THREE.DoubleSide
+});
+
+const flowerMat = new THREE.ShaderMaterial({
+  uniforms: flowerUniforms,
+  vertexShader: FLOWER_VERT,
+  fragmentShader: FLOWER_FRAG,
+  transparent: true,
+  depthTest: false,
+  depthWrite: false,
+  side: THREE.DoubleSide
+});
+
+const appleGeo  = new THREE.PlaneGeometry(1, 1, 48, 48);
+const flowerGeo = new THREE.PlaneGeometry(1, 1, 1, 1);
+
+const appleMesh  = new THREE.Mesh(appleGeo, appleMat);
+const flowerMesh = new THREE.Mesh(flowerGeo, flowerMat);
+
+appleMesh.renderOrder  = 1;
+flowerMesh.renderOrder = 0;
+
+scene.add(flowerMesh);
+scene.add(appleMesh);
+
+/* ======================= 状态 ======================= */
+let t = 0;
+let texAspect = 1;
+let fps = 60;
+let fpsAcc = 0, fpsFrames = 0, lastFrame = performance.now();
+
+const sliderEl = document.getElementById('slider');
+const stageEl  = document.getElementById('stage');
+
+const clampT = v => Math.max(-1, Math.min(1, v));
+const smoothstepJS = (e0, e1, x) => {
+  const u = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+  return u * u * (3 - 2 * u);
+};
+
+function stageName(v){
+  if (v < -0.82) return '苹果花';
+  if (v < -0.52) return '花谢 · 青果';
+  if (v < -0.10) return '青涩小果';
+  if (v <  0.06) return '现在';
+  if (v <  0.36) return '被咬一口';
+  if (v <  0.66) return '褐变 · 起皱';
+  if (v <  0.88) return '霉斑';
+  return '干瘪塌陷';
+}
+
+/* ======================= 布局 ======================= */
+function layout(){
+  const w = Math.max(1, window.innerWidth);
+  const h = Math.max(1, window.innerHeight);
+
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
+  renderer.setSize(w, h, false);
+
+  camera.left = -w / 2;
+  camera.right = w / 2;
+  camera.top = h / 2;
+  camera.bottom = -h / 2;
+  camera.updateProjectionMatrix();
+
+  // 目标显示尺寸：min(w,h) * 0.35（取长边）
+  const unit = Math.min(w, h) * 0.35;
+  let aw, ah;
+  if (texAspect >= 1){ aw = unit; ah = unit / texAspect; }
+  else               { ah = unit; aw = unit * texAspect; }
+
+  appleMesh.scale.set(aw, ah, 1);
+
+  const fl = Math.max(aw, ah) * 1.9;
+  flowerMesh.scale.set(fl, fl, 1);
+
+  // 嵌入模式：中心落在 (50%, 60%)
+  const cx = 0;
+  const cy = EMBED ? -0.10 * h : -0.02 * h;
+
+  appleMesh.position.set(cx, cy, 0);
+  flowerMesh.position.set(cx, cy, 0);
+}
+
+/* ======================= 时间接口 ======================= */
+function applyTime(){
+  appleUniforms.uT.value = t;
+  const past = Math.max(0, -t);
+  flowerUniforms.uBloom.value = smoothstepJS(0.40, 0.85, past);
+
+  if (!EMBED){
+    if (sliderEl.value !== String(t)) sliderEl.value = String(t);
+    stageEl.textContent = stageName(t);
+  }
+}
+
+function setTime(v){
+  const n = Number(v);
+  t = Number.isFinite(n) ? clampT(n) : 0;
+  applyTime();
+}
+
+window.setTime = setTime;
+window.getTime = () => t;
+window.__timeState = () => ({ t, fps });
+
+window.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'timespell:setTime') setTime(e.data.t);
+});
+
+/* ======================= UI 绑定 ======================= */
+if (!EMBED){
+  sliderEl.addEventListener('input', () => {
+    setTime(parseFloat(sliderEl.value));
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft'){
+      setTime(t - 0.01);
+      e.preventDefault();
+    } else if (e.key === 'ArrowRight'){
+      setTime(t + 0.01);
+      e.preventDefault();
+    }
+  });
+}
+
+window.addEventListener('resize', layout);
+
+/* ======================= 载入苹果图 ======================= */
+const loader = new THREE.TextureLoader();
+loader.load(
+  '/assets/apple.png',
+  (tex) => {
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+
+    const img = tex.image;
+    const iw = img.naturalWidth || img.width || 1;
+    const ih = img.naturalHeight || img.height || 1;
+    texAspect = iw / ih;
+
+    appleUniforms.uMap.value = tex;
+    appleUniforms.uAspect.value = texAspect;
+
+    layout();
+    applyTime();
+  },
+  undefined,
+  () => { /* 静默失败，保持无报错 */ }
+);
+
+/* ======================= 主循环 ======================= */
+function animate(){
+  requestAnimationFrame(animate);
+
+  const now = performance.now();
+  const dt = now - lastFrame;
+  lastFrame = now;
+
+  fpsAcc += dt;
+  fpsFrames++;
+  if (fpsAcc >= 500){
+    fps = (fpsFrames * 1000) / fpsAcc;
+    fpsAcc = 0;
+    fpsFrames = 0;
+  }
+
+  renderer.render(scene, camera);
+}
+
+layout();
+applyTime();
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+# MediaPipe 运行文件和模型（python download_models.py 下载，约 33MB）
+vendor/mediapipe/
+# 背景乐：剪映等来源的音乐有版权，只在本机使用
+assets/audio/*.mp3
+# 你自己生成的物品，满意了再移到 objects/ 提交
+objects/user/
+# AI 接口配置
+.env
+# 生成过程的中间文件
+assets/apple_raw.png
+assets/keyed/
+*.raw.md
+*.response.json
+*.part
+__pycache__/

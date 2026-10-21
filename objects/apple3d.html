@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>时光法阵 · 苹果</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+  body {
+    background: radial-gradient(ellipse at 50% 42%, #1a1e2c 0%, #0b0d14 45%, #030306 100%);
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+  }
+  html.embed, body.embed {
+    background: transparent;
+  }
+  #ui {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 0 20px 26px;
+    pointer-events: none;
+    user-select: none;
+  }
+  #stage {
+    font-size: 14px;
+    letter-spacing: 0.22em;
+    color: #e9d9b4;
+    text-shadow: 0 0 14px rgba(232, 180, 74, 0.55);
+    opacity: 0.95;
+  }
+  #slider {
+    pointer-events: auto;
+    width: min(560px, 78vw);
+    height: 4px;
+    accent-color: #e8b44a;
+    cursor: pointer;
+  }
+  body.embed #ui { display: none; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="stage">成熟红苹果</div>
+  <input id="slider" type="range" min="-1" max="1" step="0.001" value="0">
+</div>
+<script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* =========================================================
+   0. 对外接口（必须最先定义）
+   ========================================================= */
+const TAU = Math.PI * 2;
+const PI = Math.PI;
+
+let currentT = 0;
+let fpsEstimate = 60;
+let applyTimeFn = null;
+let sliderEl = null;
+let stageEl = null;
+
+const STAGES = [
+  { t: -1.00, name: '苹果花' },
+  { t: -0.62, name: '花谢 · 结出青果' },
+  { t: -0.28, name: '青果渐大' },
+  { t:  0.00, name: '成熟红苹果' },
+  { t:  0.32, name: '被咬一口' },
+  { t:  0.58, name: '切面褐变 · 果皮起皱' },
+  { t:  0.80, name: '霉斑滋生' },
+  { t:  1.00, name: '干瘪塌陷' }
+];
+
+function stageNameOf(t) {
+  let n = STAGES[0].name;
+  for (let i = 0; i < STAGES.length; i++) {
+    if (t >= STAGES[i].t - 1e-9) n = STAGES[i].name;
+  }
+  return n;
+}
+
+function setTime(v) {
+  let t = Number(v);
+  if (!isFinite(t)) return;
+  t = Math.max(-1, Math.min(1, t));
+  currentT = t;
+  if (applyTimeFn) applyTimeFn(t);
+  if (sliderEl) sliderEl.value = String(t);
+  if (stageEl) stageEl.textContent = stageNameOf(t);
+}
+
+window.setTime = setTime;
+window.getTime = () => currentT;
+window.getStages = () => STAGES.map(s => ({ t: s.t, name: s.name }));
+window.__timeState = () => ({ t: currentT, fps: fpsEstimate });
+window.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'timespell:setTime') setTime(e.data.t);
+});
+
+/* =========================================================
+   1. 工具
+   ========================================================= */
+function sstep(a, b, x) {
+  const u = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return u * u * (3 - 2 * u);
+}
+
+/* =========================================================
+   2. 模式判定
+   ========================================================= */
+const EMBED = (new URLSearchParams(location.search).get('embed') === '1');
+if (EMBED) {
+  document.documentElement.classList.add('embed');
+  document.body.classList.add('embed');
+}
+
+/* =========================================================
+   3. 渲染器 / 场景 / 相机 / 灯光
+   ========================================================= */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x000000, 0);
+document.body.appendChild(renderer.domElement);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.08;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100);
+
+/* --- 三点布光 --- */
+scene.add(new THREE.AmbientLight(0x4c5a78, 0.55));
+
+const hemi = new THREE.HemisphereLight(0x9fb6e0, 0x2b1408, 0.45);
+scene.add(hemi);
+
+const keyLight = new THREE.DirectionalLight(0xfff0dc, 2.05);
+keyLight.position.set(3.2, 4.6, 3.6);
+scene.add(keyLight);
+
+const fillLight = new THREE.DirectionalLight(0x86a4ff, 0.72);
+fillLight.position.set(-4.2, 0.6, 2.4);
+scene.add(fillLight);
+
+const rimLight = new THREE.DirectionalLight(0xffc489, 1.95);
+rimLight.position.set(-1.8, 2.6, -4.6);
+scene.add(rimLight);
+
+const underLight = new THREE.PointLight(0xff8a5c, 1.2, 12, 2.0);
+underLight.position.set(0.6, -2.6, 1.8);
+scene.add(underLight);
+
+/* =========================================================
+   4. 根节点
+   ========================================================= */
+const root = new THREE.Group();
+scene.add(root);
+
+/* =========================================================
+   5. 苹果几何（参数化球面 + 形变）
+   ========================================================= */
+const NU = 160;
+const NV = 80;
+const VCOUNT = (NU + 1) * (NV + 1);
+
+const posArr = new Float32Array(VCOUNT * 3);
+const uvArr = new Float32Array(VCOUNT * 2);
+const biteArr = new Float32Array(VCOUNT);
+
+const idxArr = new Uint32Array(NU * NV * 6);
+{
+  let p = 0;
+  for (let j = 0; j < NV; j++) {
+    for (let i = 0; i < NU; i++) {
+      const a = j * (NU + 1) + i;
+      const b = a + 1;
+      const c = a + NU + 1;
+      const d = c + 1;
+      idxArr[p++] = a; idxArr[p++] = b; idxArr[p++] = c;
+      idxArr[p++] = b; idxArr[p++] = d; idxArr[p++] = c;
+    }
+  }
+}
+for (let j = 0; j <= NV; j++) {
+  for (let i = 0; i <= NU; i++) {
+    const k = j * (NU + 1) + i;
+    uvArr[k * 2] = i / NU;
+    uvArr[k * 2 + 1] = j / NV;
+  }
+}
+
+const COST = new Float32Array(NU + 1);
+const SINT = new Float32Array(NU + 1);
+const THET = new Float32Array(NU + 1);
+for (let i = 0; i <= NU; i++) {
+  const a = (i / NU) * TAU;
+  THET[i] = a;
+  COST[i] = Math.cos(a);
+  SINT[i] = Math.sin(a);
+}
+
+const appleGeo = new THREE.BufferGeometry();
+appleGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+appleGeo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(VCOUNT * 3), 3));
+appleGeo.setAttribute('aUv', new THREE.BufferAttribute(uvArr, 2));
+appleGeo.setAttribute('uv', new THREE.BufferAttribute(uvArr.slice(), 2));
+appleGeo.setAttribute('aBite', new THREE.BufferAttribute(biteArr, 1));
+appleGeo.setIndex(new THREE.BufferAttribute(idxArr, 1));
+appleGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 2.5);
+
+/* --- 咬合方向与局部坐标系 --- */
+const BITE_DIR = new THREE.Vector3(0.88, 0.28, 0.38).normalize();
+const BITE_AX = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), BITE_DIR).normalize();
+const BITE_AY = new THREE.Vector3().crossVectors(BITE_DIR, BITE_AX).normalize();
+const BDX = BITE_DIR.x, BDY = BITE_DIR.y, BDZ = BITE_DIR.z;
+
+const BALLS = [];
+for (let i = 0; i < 7; i++) BALLS.push({ cx: 0, cy: 0, cz: 0, r2: 0, cc: 0 });
+
+/* =========================================================
+   6. 苹果材质（程序化着色）
+   ========================================================= */
+const appleUniforms = {
+  uRipe:    { value: 0 },
+  uBite:    { value: 0 },
+  uBrown:   { value: 0 },
+  uMold:    { value: 0 },
+  uWrinkle: { value: 0 }
+};
+
+const appleMat = new THREE.MeshPhysicalMaterial({
+  color: 0xffffff,
+  roughness: 0.38,
+  metalness: 0.0,
+  clearcoat: 0.55,
+  clearcoatRoughness: 0.28,
+  sheen: 0.0
+});
+
+appleMat.onBeforeCompile = (shader) => {
+  shader.uniforms.uRipe = appleUniforms.uRipe;
+  shader.uniforms.uBite = appleUniforms.uBite;
+  shader.uniforms.uBrown = appleUniforms.uBrown;
+  shader.uniforms.uMold = appleUniforms.uMold;
+  shader.uniforms.uWrinkle = appleUniforms.uWrinkle;
+
+  shader.vertexShader = `
+attribute vec2 aUv;
+attribute float aBite;
+varying vec2 vAUv;
+varying float vBt;
+` + shader.vertexShader;
+
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <begin_vertex>',
+    `#include <begin_vertex>
+     vAUv = aUv;
+     vBt = aBite;`
+  );
+
+  shader.fragmentShader = `
+varying vec2 vAUv;
+varying float vBt;
+uniform float uRipe;
+uniform float uBite;
+uniform float uBrown;
+uniform float uMold;
+uniform float uWrinkle;
+
+const float TAUX = 6.28318530718;
+
+vec3 appleSkin(vec2 uv) {
+  float u = uv.x;
+  float v = uv.y;
+
+  // 纵向红色条纹
+  float s1 = 0.5 + 0.5 * sin(u * TAUX * 9.0 + sin(v * 7.0) * 1.6);
+  float s2 = 0.5 + 0.5 * sin(u * TAUX * 23.0 - v * 12.0);
+  float s3 = 0.5 + 0.5 * sin(u * TAUX * 41.0 + v * 27.0 + 1.1);
+  float streak = s1 * 0.55 + s2 * 0.30 + s3 * 0.15;
+
+  float mot = 0.5 + 0.5 * sin(u * TAUX * 37.0 + v * 21.0) * cos(v * 33.0 - u * TAUX * 5.0);
+
+  vec3 redDark   = vec3(0.55, 0.032, 0.058);
+  vec3 redBright = vec3(0.88, 0.145, 0.105);
+  vec3 skin = mix(redDark, redBright, clamp(streak * 0.82 + mot * 0.22, 0.0, 1.0));
+
+  // 顶部梗窝偏黄绿
+  float topZone = smoothstep(0.30, 0.015, v);
+  skin = mix(skin, vec3(0.66, 0.60, 0.17), topZone * 0.62);
+
+  // 底部略暗
+  float botZone = smoothstep(0.82, 1.0, v);
+  skin = mix(skin, vec3(0.40, 0.045, 0.055), botZone * 0.5);
+
+  // 未成熟的青涩
+  vec3 green = mix(vec3(0.235, 0.415, 0.115), vec3(0.545, 0.655, 0.195), streak);
+  green = mix(green, vec3(0.40, 0.53, 0.16), topZone * 0.45);
+  skin = mix(green, skin, clamp(uRipe, 0.0, 1.0));
+
+  // 起皱带来的暗沉
+  skin *= 1.0 - 0.16 * uWrinkle;
+
+  // 全局褐变
+  float bn = 0.5 + 0.5 * sin(u * TAUX * 17.0 + v * 29.0) * cos(v * 13.0 - u * TAUX * 3.0);
+  float bAmt = clamp(uBrown * (0.45 + 0.85 * bn), 0.0, 1.0);
+  skin = mix(skin, vec3(0.40, 0.245, 0.105), bAmt * 0.86);
+
+  return skin;
+}
+
+vec3 appleFlesh(vec2 uv) {
+  float u = uv.x;
+  float v = uv.y;
+  float f1 = 0.5 + 0.5 * sin(u * TAUX * 29.0 + v * 37.0);
+  float f2 = 0.5 + 0.5 * sin(u * TAUX * 61.0 - v * 47.0 + 2.1);
+  vec3 flesh = mix(vec3(0.965, 0.935, 0.805), vec3(0.855, 0.815, 0.655), f1 * 0.6 + f2 * 0.2);
+  // 果肉褐变（从外向内）
+  float bAmt = clamp(uBrown * 1.18, 0.0, 1.0);
+  flesh = mix(flesh, vec3(0.335, 0.205, 0.098), bAmt);
+  return flesh;
+}
+
+vec3 moldOverlay(vec3 base, vec2 uv, float amount) {
+  float u = uv.x;
+  float v = uv.y;
+  float m1 = 0.5 + 0.5 * sin(u * TAUX * 11.0 + v * 23.0 + 1.7) * cos(v * 31.0 - u * TAUX * 7.0);
+  float m2 = 0.5 + 0.5 * sin(u * TAUX * 43.0 - v * 19.0 + 0.4) * cos(v * 51.0 + u * TAUX * 13.0);
+  float n = clamp(m1 * 0.72 + m2 * 0.42, 0.0, 1.0);
+  n = pow(n, 2.1);
+  float mask = smoothstep(0.36, 0.86, n) * amount;
+  vec3 moldCol = mix(vec3(0.74, 0.775, 0.70), vec3(0.255, 0.335, 0.225), n);
+  return mix(base, moldCol, clamp(mask * 0.94, 0.0, 1.0));
+}
+` + shader.fragmentShader;
+
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <color_fragment>',
+    `#include <color_fragment>
+     {
+       vec3 cSkin  = appleSkin(vAUv);
+       vec3 cFlesh = appleFlesh(vAUv);
+       vec3 c = mix(cSkin, cFlesh, clamp(vBt, 0.0, 1.0));
+       c = moldOverlay(c, vAUv, uMold);
+       diffuseColor.rgb = c;
+     }`
+  );
+
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <roughnessmap_fragment>',
+    `#include <roughnessmap_fragment>
+     roughnessFactor = mix(roughnessFactor, 0.92, clamp(vBt, 0.0, 1.0) * 0.85);
+     roughnessFactor = mix(roughnessFactor, 0.97, clamp(uMold, 0.0, 1.0) * 0.55);
+     roughnessFactor = mix(roughnessFactor, 0.78, clamp(uWrinkle, 0.0, 1.0) * 0.45);`
+  );
+};
+
+const appleMesh = new THREE.Mesh(appleGeo, appleMat);
+appleMesh.frustumCulled = false;
+root.add(appleMesh);
+
+/* =========================================================
+   7. 梗 / 叶子
+   ========================================================= */
+const stemLeafGroup = new THREE.Group();
+root.add(stemLeafGroup);
+
+const stemMat = new THREE.MeshStandardMaterial({
+  color: 0x7a6038, roughness: 0.82, metalness: 0.0
+});
+const leafMat = new THREE.MeshStandardMaterial({
+  color: 0x4e8a2e, roughness: 0.66, metalness: 0.0, side: THREE.DoubleSide
+});
+
+const stemCurve = new THREE.CatmullRomCurve3([
+  new THREE.Vector3(0.000, 0.78, 0.000),
+  new THREE.Vector3(0.014, 0.92, 0.010),
+  new THREE.Vector3(0.048, 1.06, 0.030),
+  new THREE.Vector3(0.092, 1.155, 0.052)
+]);
+const stemGeo = new THREE.TubeGeometry(stemCurve, 22, 0.027, 8, false);
+const stemMesh = new THREE.Mesh(stemGeo, stemMat);
+stemLeafGroup.add(stemMesh);
+
+function makeLeafGeometry() {
+  const SU = 16, SV = 8;
+  const pos = [];
+  const idx = [];
+  for (let i = 0; i <= SU; i++) {
+    const u = i / SU;
+    for (let j = 0; j <= SV; j++) {
+      const v = (j / SV) * 2 - 1;
+      const w = 0.088 * Math.pow(Math.sin(PI * Math.pow(u, 0.72)), 0.85) * (1 - 0.08 * u);
+      const x = w * v;
+      const z = 0.54 * u;
+      const y = 0.30 * u - 0.66 * u * u + 0.055 * (1 - v * v) * (1 - 0.35 * u);
+      pos.push(x, y, z);
+    }
+  }
+  for (let i = 0; i < SU; i++) {
+    for (let j = 0; j < SV; j++) {
+      const a = i * (SV + 1) + j;
+      const b = a + 1;
+      const c = a + SV + 1;
+      const d = c + 1;
+      idx.push(a, c, b, b, c, d);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+const leafGeo = makeLeafGeometry();
+const leafPivot = new THREE.Group();
+leafPivot.position.set(0.028, 0.90, 0.018);
+leafPivot.rotation.y = 0.95;
+leafPivot.rotation.z = 0.10;
+const leafMesh = new THREE.Mesh(leafGeo, leafMat);
+leafPivot.add(leafMesh);
+stemLeafGroup.add(leafPivot);
+
+/* =========================================================
+   8. 花（花瓣 + 花蕊）
+   ========================================================= */
+const flowerGroup = new THREE.Group();
+root.add(flowerGroup);
+
+function makePetalGeometry() {
+  const SU = 10, SV = 8;
+  const pos = [];
+  const idx = [];
+  for (let i = 0; i <= SU; i++) {
+    const u = i / SU;
+    for (let j = 0; j <= SV; j++) {
+      const v = (j / SV) * 2 - 1;
+      const w = 0.155 * Math.pow(Math.sin(PI * Math.pow(u, 0.82)), 0.75) * (1 - 0.12 * u);
+      const x = w * v;
+      const z = 0.62 * u;
+      const y = 0.20 * u * u + 0.145 * v * v * (0.30 + 0.70 * u);
+      pos.push(x, y, z);
+    }
+  }
+  for (let i = 0; i < SU; i++) {
+    for (let j = 0; j < SV; j++) {
+      const a = i * (SV + 1) + j;
+      const b = a + 1;
+      const c = a + SV + 1;
+      const d = c + 1;
+      idx.push(a, c, b, b, c, d);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+const petalGeo = makePetalGeometry();
+const petalMat = new THREE.MeshStandardMaterial({
+  color: 0xfdf3ee,
+  roughness: 0.62,
+  metalness: 0.0,
+  side: THREE.DoubleSide,
+  emissive: 0x2a1418,
+  emissiveIntensity: 0.28
+});
+
+const petalPivots = [];
+for (let k = 0; k < 5; k++) {
+  const pivot = new THREE.Group();
+  pivot.rotation.y = (k / 5) * TAU;
+  const m = new THREE.Mesh(petalGeo, petalMat);
+  m.rotation.x = -0.95;
+  pivot.add(m);
+  flowerGroup.add(pivot);
+  petalPivots.push({ pivot, mesh: m });
+}
+
+// 花蕊
+const stamenCount = 46;
+const stamenMat = new THREE.MeshStandardMaterial({
+  color: 0xffc23a, roughness: 0.55, metalness: 0.0,
+  emissive: 0x3a2600, emissiveIntensity: 0.5
+});
+const stamenMesh = new THREE.InstancedMesh(
+  new THREE.SphereGeometry(0.0165, 6, 5),
+  stamenMat,
+  stamenCount
+);
+{
+  const dummy = new THREE.Object3D();
+  for (let i = 0; i < stamenCount; i++) {
+    const a = i * 2.399963229728653;
+    const r = 0.105 * Math.sqrt((i + 0.5) / stamenCount);
+    const lift = 0.028 + 0.055 * ((i * 0.6180339887) % 1.0);
+    dummy.position.set(Math.cos(a) * r, lift, Math.sin(a) * r);
+    dummy.scale.setScalar(0.78 + 0.52 * ((i * 0.3819660113) % 1.0));
+    dummy.rotation.set(0, 0, 0);
+    dummy.updateMatrix();
+    stamenMesh.setMatrixAt(i, dummy.matrix);
+  }
+  stamenMesh.instanceMatrix.needsUpdate = true;
+}
+flowerGroup.add(stamenMesh);
+
+/* =========================================================
+   9. 时间驱动的几何更新
+   ========================================================= */
+function appleScaleOf(t) {
+  const g = sstep(-0.98, -0.02, t);
+  return 0.24 + 0.76 * Math.pow(g, 0.8);
+}
+
+function updateAppleGeom(collapse, wrinkle, biteProg, scale) {
+  // 预计算咬合球
+  if (biteProg > 0.002) {
+    for (let k = 0; k < 7; k++) {
+      const off = (k - 3) / 3.2;
+      const dist = 1.03 + 0.24 * (1 - biteProg) + 0.05 * Math.abs(off);
+      const rr = (0.30 + 0.018 * Math.sin(k * 1.7)) * biteProg;
+      const B = BALLS[k];
+      B.cx = BITE_DIR.x * dist + BITE_AX.x * off * 0.60 + BITE_AY.x * off * off * 0.11;
+      B.cy = BITE_DIR.y * dist + BITE_AX.y * off * 0.60 + BITE_AY.y * off * off * 0.11;
+      B.cz = BITE_DIR.z * dist + BITE_AX.z * off * 0.60 + BITE_AY.z * off * off * 0.11;
+      B.r2 = rr * rr;
+      B.cc = B.cx * B.cx + B.cy * B.cy + B.cz * B.cz;
+    }
+  }
+
+  const doBite = biteProg > 0.002;
+  const doWrinkle = wrinkle > 0.0005;
+
+  let vi = 0;
+  for (let j = 0; j <= NV; j++) {
+    const phi = (j / NV) * PI;
+    const sp = Math.sin(phi);
+    const cp = Math.cos(phi);
+
+    const dipTop = Math.exp(-phi * phi / 0.10);
+    const dd = PI - phi;
+    const dipBot = Math.exp(-dd * dd / 0.08);
+
+    let baseY = cp * 1.10 - 0.20 * dipTop + 0.13 * dipBot;
+    let baseR = sp * (1 + 0.06 * sp) * (1 - 0.10 * Math.max(0, cp));
+
+    // 干瘪塌陷
+    baseY *= 1 - 0.33 * collapse;
+    baseY -= 0.17 * collapse * dipTop;
+    baseR *= 1 - 0.075 * collapse;
+
+    for (let i = 0; i <= NU; i++) {
+      const ct = COST[i];
+      const st = SINT[i];
+      const th = THET[i];
+
+      let rad = baseR;
+      let y = baseY;
+
+      if (doWrinkle) {
+        const w1 = Math.sin(th * 7 + phi * 5.0);
+        const w2 = Math.sin(th * 13 - phi * 9.0 + 1.3);
+        const w3 = Math.sin(th * 19 + phi * 17.0 + 2.7);
+        const w4 = Math.sin(th * 3 - phi * 23.0 + 0.6);
+        const wn = w1 * 0.42 + w2 * 0.28 + w3 * 0.18 + w4 * 0.12;
+        rad *= 1 + wn * 0.062 * wrinkle;
+        y += wn * 0.036 * wrinkle * (0.35 + 0.65 * sp);
+      }
+
+      let x = rad * ct;
+      let z = rad * st;
+      let biteVal = 0;
+
+      if (doBite) {
+        const L = Math.sqrt(x * x + y * y + z * z);
+        if (L > 0.05) {
+          const invL = 1 / L;
+          const dx = x * invL, dy = y * invL, dz = z * invL;
+          const dot = dx * BDX + dy * BDY + dz * BDZ;
+          if (dot > 0.50) {
+            let best = L;
+            for (let k = 0; k < 7; k++) {
+              const B = BALLS[k];
+              const kk = dx * B.cx + dy * B.cy + dz * B.cz;
+              const D2 = kk * kk - B.cc + B.r2;
+              if (D2 > 0) {
+                const sq = Math.sqrt(D2);
+                const rho = kk - sq;
+                if (rho > 0.02 && rho < best) best = rho;
+              }
+            }
+            if (best < L) {
+              biteVal = Math.min(1, (L - best) / 0.05);
+              x = dx * best;
+              y = dy * best;
+              z = dz * best;
+            }
+          }
+        }
+      }
+
+      posArr[vi * 3]     = x * scale;
+      posArr[vi * 3 + 1] = y * scale;
+      posArr[vi * 3 + 2] = z * scale;
+      biteArr[vi] = biteVal;
+      vi++;
+    }
+  }
+
+  appleGeo.attributes.position.needsUpdate = true;
+  appleGeo.attributes.aBite.needsUpdate = true;
+  appleGeo.computeVertexNormals();
+}
+
+/* =========================================================
+   10. 主时间应用函数（画面 = t 的纯函数）
+   ========================================================= */
+const stemColorFresh = new THREE.Color(0x7a6038);
+const stemColorDry   = new THREE.Color(0x463522);
+const leafColorFresh = new THREE.Color(0x4e8a2e);
+const leafColorDry   = new THREE.Color(0x6b5324);
+
+function applyTime(T) {
+  // ---- 派生量 ----
+  const collapse  = sstep(0.78, 1.00, T);
+  const wrinkle   = sstep(0.42, 0.96, T);
+  const biteProg  = sstep(0.24, 0.40, T);
+  const ripe      = sstep(-0.42, 0.02, T);
+  const brown     = sstep(0.42, 0.86, T);
+  const mold      = sstep(0.62, 0.96, T);
+  const scale     = appleScaleOf(T);
+  const petalDie  = sstep(-0.80, -0.56, T);
+  const dry       = sstep(0.30, 1.00, T);
+
+  // ---- 苹果几何 ----
+  updateAppleGeom(collapse, wrinkle, biteProg, scale);
+
+  // ---- 苹果材质 uniform ----
+  appleUniforms.uRipe.value = ripe;
+  appleUniforms.uBite.value = biteProg;
+  appleUniforms.uBrown.value = brown;
+  appleUniforms.uMold.value = mold;
+  appleUniforms.uWrinkle.value = wrinkle;
+
+  // ---- 整体姿态（只由 t 决定）----
+  root.rotation.y = 0.55 + 0.34 * T;
+  root.rotation.z = 0.035 * Math.sin(T * 2.3);
+
+  // ---- 梗 / 叶 ----
+  stemLeafGroup.scale.setScalar(scale);
+  stemMat.color.copy(stemColorFresh).lerp(stemColorDry, dry);
+  leafMat.color.copy(leafColorFresh).lerp(leafColorDry, dry);
+  leafPivot.rotation.z = 0.10 - 0.52 * dry;
+  leafPivot.rotation.y = 0.95 + 0.35 * dry;
+
+  // ---- 花 ----
+  const dieS = Math.max(0.0001, 1 - petalDie);
+  flowerGroup.visible = petalDie < 0.995;
+  flowerGroup.position.y = 0.92 * scale + 0.012;
+  flowerGroup.scale.setScalar(1);
+
+  for (let k = 0; k < petalPivots.length; k++) {
+    const p = petalPivots[k];
+    const m = p.mesh;
+    m.scale.setScalar(dieS);
+    m.rotation.x = -0.95 + 0.62 * petalDie;
+    m.position.y = -0.26 * petalDie * petalDie;
+    m.position.z = 0.09 * petalDie;
+    p.pivot.rotation.y = (k / 5) * TAU + 0.22 * petalDie;
+  }
+  stamenMesh.scale.setScalar(dieS);
+  stamenMat.color.setHSL(0.12, 0.85, 0.55 - 0.18 * petalDie);
+}
+
+applyTimeFn = applyTime;
+
+/* =========================================================
+   11. 相机 / 尺寸适配
+   ========================================================= */
+function updateCamera() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  if (w === 0 || h === 0) return;
+
+  camera.aspect = w / h;
+
+  const fovRad = camera.fov * PI / 180;
+  const tanF = Math.tan(fovRad / 2);
+
+  let D;
+  if (EMBED) {
+    const R = 1.32;
+    D = R * h / (0.35 * tanF * Math.min(w, h));
+    D = Math.max(D, 3.0);
+  } else {
+    D = 5.4;
+  }
+
+  camera.position.set(0, 0.07 * D, D);
+  camera.lookAt(0, 0, 0);
+  camera.updateProjectionMatrix();
+
+  // 物品中心下移到画面 60% 处（嵌入模式）/ 略下移（独立模式）
+  const shiftWorld = (EMBED ? 0.20 : 0.07) * D * tanF;
+  root.position.y = -shiftWorld;
+}
+
+function onResize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  renderer.setSize(w, h);
+  updateCamera();
+}
+window.addEventListener('resize', onResize);
+
+/* =========================================================
+   12. UI 绑定
+   ========================================================= */
+sliderEl = document.getElementById('slider');
+stageEl = document.getElementById('stage');
+
+if (sliderEl) {
+  sliderEl.addEventListener('input', (e) => {
+    setTime(parseFloat(e.target.value));
+  });
+}
+window.addEventListener('keydown', (e) => {
+  if (EMBED) return;
+  if (e.key === 'ArrowLeft') {
+    e.preventDefault();
+    setTime(currentT - 0.02);
+  } else if (e.key === 'ArrowRight') {
+    e.preventDefault();
+    setTime(currentT + 0.02);
+  }
+});
+
+/* =========================================================
+   13. 启动
+   ========================================================= */
+updateCamera();
+
+// 初次应用（保持 t = 0）
+setTime(0);
+window.parent.postMessage({ type: 'timespell:stages', stages: window.getStages() }, '*');
+
+let lastFrameStamp = performance.now();
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = now - lastFrameStamp;
+  lastFrameStamp = now;
+  if (dt > 0) {
+    const inst = 1000 / dt;
+    fpsEstimate = fpsEstimate * 0.92 + inst * 0.08;
+  }
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>

@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>时光法阵 · 蜡烛</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
+  body {
+    background: radial-gradient(ellipse at 50% 55%, #12131c 0%, #05050a 62%, #020204 100%);
+  }
+  body.embed { background: transparent; }
+  canvas { position: fixed; inset: 0; display: block; }
+  #ui {
+    position: fixed; left:0; right:0; bottom:0; padding: 0 20px 26px;
+    display:flex; flex-direction:column; align-items:center; gap:10px;
+    font-family: ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color:#c8cfe0; user-select:none; pointer-events:none;
+  }
+  #stageName {
+    font-size:14px; letter-spacing:.22em; color:#e6d3a6;
+    text-shadow:0 0 14px rgba(255,190,90,.5);
+  }
+  #slider {
+    pointer-events:auto;
+    width:min(520px, 72vw); height:4px; -webkit-appearance:none; appearance:none;
+    border-radius:2px; background:linear-gradient(90deg,#2c3550,#6e7ba6,#2c3550);
+    outline:none; cursor:pointer;
+  }
+  #slider::-webkit-slider-thumb {
+    -webkit-appearance:none; width:16px; height:16px; border-radius:50%;
+    background:#ffd79a; box-shadow:0 0 12px rgba(255,190,90,.95); border:none;
+  }
+  #slider::-moz-range-thumb {
+    width:16px; height:16px; border:none; border-radius:50%;
+    background:#ffd79a; box-shadow:0 0 12px rgba(255,190,90,.95);
+  }
+  #hint { font-size:11px; letter-spacing:.14em; color:#5a6280; }
+  body.embed #ui { display:none; }
+</style>
+<script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+</head>
+<body>
+<div id="ui">
+  <div id="stageName">点燃的白蜡烛</div>
+  <input id="slider" type="range" min="-1" max="1" step="0.001" value="0">
+  <div id="hint">← → 微调时间</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* =========================================================================
+   0. 阶段定义 + 对外接口（先定义，不等待任何资源）
+   ========================================================================= */
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+if (EMBED) document.body.classList.add('embed');
+
+const STAGES = [
+  { t: -1.00, name: '蜂巢' },
+  { t: -0.66, name: '蜂蜡块' },
+  { t: -0.33, name: '崭新蜡烛' },
+  { t:  0.00, name: '点燃的白蜡烛' },
+  { t:  0.33, name: '渐短 · 蜡泪' },
+  { t:  0.66, name: '熄灭 · 冒烟' },
+  { t:  1.00, name: '一滩残蜡' }
+];
+
+let t = 0;
+let fps = 60;
+let ready = false;
+
+window.getTime = () => t;
+window.getStages = () => STAGES.map(s => ({ t: s.t, name: s.name }));
+window.__timeState = () => ({ t, fps });
+
+window.setTime = function (v) {
+  const n = Number(v);
+  t = Number.isFinite(n) ? Math.max(-1, Math.min(1, n)) : 0;
+  if (ready) {
+    updateScene(t);
+    renderer.render(scene, camera);
+    syncUI();
+  }
+};
+
+window.addEventListener('message', (e) => {
+  const d = e.data;
+  if (d && d.type === 'timespell:setTime') window.setTime(d.t);
+});
+
+/* =========================================================================
+   1. 工具函数
+   ========================================================================= */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let x = Math.imul(a ^ (a >>> 15), 1 | a);
+    x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x;
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+
+const KT = [-1, -0.66, -0.33, 0, 0.33, 0.66, 1];
+function track(vals) {
+  const n = vals.length;
+  return function (x) {
+    if (x <= KT[0]) return vals[0];
+    if (x >= KT[n - 1]) return vals[n - 1];
+    for (let i = 0; i < n - 1; i++) {
+      if (x <= KT[i + 1]) {
+        let u = (x - KT[i]) / (KT[i + 1] - KT[i]);
+        u = u * u * (3 - 2 * u);
+        return vals[i] + (vals[i + 1] - vals[i]) * u;
+      }
+    }
+    return vals[n - 1];
+  };
+}
+
+/* ---- 随时间连续变化的参数轨道 ---- */
+const P = {
+  H:        track([1.02, 0.92, 1.95, 1.62, 1.05, 0.42, 0.13]),
+  R:        track([0.55, 0.57, 0.44, 0.45, 0.455, 0.45, 0.30]),
+  dish:     track([0.00, 0.02, 0.015, 0.05, 0.10, 0.12, 0.06]),
+  hex:      track([1.00, 0.30, 0.00, 0.00, 0.00, 0.00, 0.00]),
+  gold:     track([1.00, 0.52, 0.06, 0.00, 0.00, 0.03, 0.05]),
+  roundTop: track([0.00, 0.85, 0.10, 0.00, 0.00, 0.00, 0.60]),
+  poolR:    track([0.00, 0.00, 0.00, 0.00, 0.30, 0.62, 0.95]),
+  poolH:    track([0.00, 0.00, 0.00, 0.00, 0.05, 0.08, 0.11]),
+  drips:    track([0.00, 0.00, 0.00, 0.10, 0.75, 1.00, 0.35]),
+  flame:    track([0.00, 0.00, 0.00, 1.00, 0.75, 0.00, 0.00]),
+  wick:     track([0.00, 0.00, 1.00, 1.00, 0.92, 0.55, 0.30]),
+  smoke:    track([0.00, 0.00, 0.00, 0.00, 0.05, 1.00, 0.00])
+};
+
+/* =========================================================================
+   2. 渲染器 / 场景 / 相机
+   ========================================================================= */
+const renderer = new THREE.WebGLRenderer({
+  antialias: true,
+  alpha: EMBED,
+  powerPreference: 'high-performance'
+});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+if (EMBED) renderer.setClearColor(0x000000, 0);
+else renderer.setClearColor(0x05050a, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 120);
+
+const CAM_DIR = new THREE.Vector3(0.62, 0.44, 1.0).normalize();
+const OBJECT_SIZE = 2.0;   // 物体名义外接尺寸（世界单位）
+const SCREEN_SHARE = 0.35; // 占 min(宽,高) 的比例
+
+function updateCamera() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const aspect = w / h;
+  camera.aspect = aspect;
+  const tanHalf = Math.tan(camera.fov * 0.5 * Math.PI / 180);
+  let d = OBJECT_SIZE / (2 * SCREEN_SHARE * tanHalf);
+  if (aspect < 1) d /= aspect;
+  camera.position.copy(CAM_DIR).multiplyScalar(d);
+  camera.lookAt(0, 0, 0);
+  // 相机整体上移，使物体中心落在画面纵向 60% 处
+  camera.position.y += 0.20 * d * tanHalf;
+  camera.updateProjectionMatrix();
+}
+updateCamera();
+
+/* =========================================================================
+   3. 灯光（三点布光 + 环境光）
+   ========================================================================= */
+scene.add(new THREE.HemisphereLight(0x9fb4ff, 0x1a0f0a, 0.55));
+scene.add(new THREE.AmbientLight(0x2a3050, 1.0));
+
+const keyLight = new THREE.DirectionalLight(0xfff2e2, 2.8);
+keyLight.position.set(3.2, 4.6, 3.6);
+scene.add(keyLight);
+
+const fillLight = new THREE.DirectionalLight(0x9db4ff, 1.05);
+fillLight.position.set(-4.2, 1.2, 2.2);
+scene.add(fillLight);
+
+const rimLight = new THREE.DirectionalLight(0xffcf8a, 2.3);
+rimLight.position.set(-1.8, 2.6, -4.4);
+scene.add(rimLight);
+
+/* =========================================================================
+   4. 物体根节点
+   ========================================================================= */
+const root = new THREE.Group();
+scene.add(root);
+
+const COL_WHITE = new THREE.Color(0xf1ead9);
+const COL_HONEY = new THREE.Color(0xd79a36);
+const waxColor = new THREE.Color();
+
+const waxMat = new THREE.MeshStandardMaterial({
+  color: 0xf1ead9,
+  roughness: 0.42,
+  metalness: 0.0,
+  emissive: new THREE.Color(0x000000)
+});
+
+/* ---------------- 4.1 蜡烛主体（车削式旋转体，逐帧重算顶剖面） ---------------- */
+const RADIAL = 72;
+const RINGS  = 38;
+const NBOT = 3, NTOP = 9, NSIDE = RINGS - NBOT - NTOP;
+
+const bodyGeo = (function () {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(RINGS * RADIAL * 3), 3));
+  const idx = new Uint32Array((RINGS - 1) * RADIAL * 6);
+  let o = 0;
+  for (let i = 0; i < RINGS - 1; i++) {
+    for (let j = 0; j < RADIAL; j++) {
+      const a = i * RADIAL + j;
+      const b = i * RADIAL + (j + 1) % RADIAL;
+      const c = (i + 1) * RADIAL + j;
+      const d = (i + 1) * RADIAL + (j + 1) % RADIAL;
+      idx[o++] = a; idx[o++] = c; idx[o++] = b;
+      idx[o++] = b; idx[o++] = c; idx[o++] = d;
+    }
+  }
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  return g;
+})();
+
+const body = new THREE.Mesh(bodyGeo, waxMat);
+root.add(body);
+
+const profR = new Float32Array(RINGS);
+const profY = new Float32Array(RINGS);
+
+function rebuildBody(H, R, dish, roundTop, hex) {
+  const domeH = roundTop * Math.min(R * 0.90, H * 0.70);
+  const sideTop = H - domeH;
+
+  let k = 0;
+  // 底面（中心 → 边缘）
+  for (let i = 0; i < NBOT; i++) { profR[k] = R * (i / NBOT); profY[k] = 0; k++; }
+  // 侧壁
+  for (let i = 0; i < NSIDE; i++) {
+    const v = i / (NSIDE - 1);
+    const wob = 0.010 * Math.sin(v * 9.0 + 0.4) + 0.005 * Math.sin(v * 23.0 + 1.7);
+    profR[k] = R * (1 + wob);
+    profY[k] = v * sideTop;
+    k++;
+  }
+  // 顶部（圆顶 或 融蜡凹面）
+  if (domeH > 1e-4) {
+    for (let i = 1; i <= NTOP; i++) {
+      const s = i / NTOP;
+      const a = s * Math.PI * 0.5;
+      profR[k] = R * Math.cos(a) * (1 + 0.012 * Math.sin(s * 7.0));
+      profY[k] = sideTop + domeH * Math.sin(a);
+      k++;
+    }
+  } else {
+    for (let i = 1; i <= NTOP; i++) {
+      const s = i / NTOP;
+      profR[k] = R * (1 - s);
+      profY[k] = H - dish * Math.pow(s, 1.5);
+      k++;
+    }
+  }
+
+  const pos = bodyGeo.attributes.position.array;
+  let p = 0;
+  for (let i = 0; i < RINGS; i++) {
+    const r0 = profR[i], y = profY[i];
+    for (let j = 0; j < RADIAL; j++) {
+      const th = (j / RADIAL) * Math.PI * 2;
+      const rr = r0 * (1 + hex * 0.12 * Math.cos(6 * th));
+      pos[p++] = rr * Math.cos(th);
+      pos[p++] = y;
+      pos[p++] = rr * Math.sin(th);
+    }
+  }
+  bodyGeo.attributes.position.needsUpdate = true;
+  bodyGeo.computeVertexNormals();
+  bodyGeo.computeBoundingSphere();
+}
+
+/* ---------------- 4.2 底部蜡池 ---------------- */
+const POOL_RINGS = 9, POOL_SEGS = 64;
+const poolGeo = (function () {
+  const g = new THREE.BufferGeometry();
+  const n = (POOL_RINGS + 1) * POOL_SEGS;
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+  const idx = [];
+  for (let i = 0; i < POOL_RINGS; i++) {
+    for (let j = 0; j < POOL_SEGS; j++) {
+      const a = i * POOL_SEGS + j;
+      const b = i * POOL_SEGS + (j + 1) % POOL_SEGS;
+      const c = (i + 1) * POOL_SEGS + j;
+      const d = (i + 1) * POOL_SEGS + (j + 1) % POOL_SEGS;
+      idx.push(a, b, c, b, d, c);
+    }
+  }
+  g.setIndex(idx);
+  return g;
+})();
+const pool = new THREE.Mesh(poolGeo, waxMat);
+root.add(pool);
+
+function updatePool(Rp, Ht) {
+  const pos = poolGeo.attributes.position.array;
+  const nor = poolGeo.attributes.normal.array;
+  const invRp2 = 1 / Math.max(Rp * Rp, 1e-4);
+  let p = 0;
+  for (let i = 0; i <= POOL_RINGS; i++) {
+    const u = i / POOL_RINGS;
+    for (let j = 0; j < POOL_SEGS; j++) {
+      const th = (j / POOL_SEGS) * Math.PI * 2;
+      const wob = 1 + (0.13 * Math.sin(3 * th + 0.7) + 0.07 * Math.sin(5 * th + 2.1)) * u;
+      const rad = Rp * u * wob;
+      pos[p]     = rad * Math.cos(th);
+      pos[p + 1] = Ht * (1 - 0.80 * u * u);
+      pos[p + 2] = rad * Math.sin(th);
+      const dr = 1.6 * Ht * rad * invRp2;
+      const nx = dr * Math.cos(th), ny = 1.0, nz = dr * Math.sin(th);
+      const inv = 1 / Math.hypot(nx, ny, nz);
+      nor[p] = nx * inv; nor[p + 1] = ny * inv; nor[p + 2] = nz * inv;
+      p += 3;
+    }
+  }
+  poolGeo.attributes.position.needsUpdate = true;
+  poolGeo.attributes.normal.needsUpdate = true;
+  poolGeo.computeBoundingSphere();
+}
+
+/* ---------------- 4.3 烛芯 ---------------- */
+const wickGeo = new THREE.CylinderGeometry(0.020, 0.028, 1, 8, 1, false);
+wickGeo.translate(0, 0.5, 0);
+const wickMat = new THREE.MeshStandardMaterial({ color: 0x241c14, roughness: 0.95, metalness: 0 });
+const wick = new THREE.Mesh(wickGeo, wickMat);
+root.add(wick);
+
+const wickTip = new THREE.Mesh(
+  new THREE.SphereGeometry(0.030, 10, 8),
+  new THREE.MeshStandardMaterial({ color: 0x120c07, roughness: 1.0 })
+);
+root.add(wickTip);
+
+/* ---------------- 4.4 火焰 ---------------- */
+const flamePts = [];
+for (let i = 0; i <= 16; i++) {
+  const v = i / 16;
+  const rr = Math.sin(Math.pow(v, 0.55) * Math.PI) * 0.5;
+  flamePts.push(new THREE.Vector2(Math.max(rr, 0.0005), v));
+}
+const flameGeo = new THREE.LatheGeometry(flamePts, 28);
+
+const flameMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uWobble: { value: 0 },
+    uIntensity: { value: 1 }
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    varying float vH;
+    uniform float uWobble;
+    void main() {
+      vUv = uv;
+      vec3 p = position;
+      float s = sin(p.y * 13.0 + uWobble * 3.1) * 0.10
+              + sin(p.y * 21.0 - uWobble * 2.3) * 0.05;
+      p.x += s * p.y * 0.55;
+      p.z += cos(p.y * 11.0 + uWobble * 2.7) * 0.09 * p.y;
+      vH = uv.y;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    varying float vH;
+    uniform float uIntensity;
+    void main() {
+      vec3 low = vec3(0.95, 0.26, 0.03);
+      vec3 mid = vec3(1.00, 0.60, 0.14);
+      vec3 hot = vec3(1.00, 0.97, 0.82);
+      vec3 c = mix(low, mid, smoothstep(0.0, 0.45, vH));
+      c = mix(c, hot, smoothstep(0.48, 0.95, vH));
+      float a = smoothstep(0.0, 0.16, vH) * (1.0 - smoothstep(0.72, 1.0, vH));
+      a *= uIntensity;
+      gl_FragColor = vec4(c * (1.25 + uIntensity * 0.75), a * 0.92);
+    }
+  `,
+  transparent: true,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  side: THREE.DoubleSide
+});
+const flame = new THREE.Mesh(flameGeo, flameMat);
+root.add(flame);
+
+/* 火焰辉光 */
+const glowCanvas = document.createElement('canvas');
+glowCanvas.width = glowCanvas.height = 128;
+(function () {
+  const c = glowCanvas.getContext('2d');
+  const g = c.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0.00, 'rgba(255,226,170,0.85)');
+  g.addColorStop(0.30, 'rgba(255,172,72,0.38)');
+  g.addColorStop(1.00, 'rgba(255,110,20,0.00)');
+  c.fillStyle = g;
+  c.fillRect(0, 0, 128, 128);
+})();
+const glowTex = new THREE.CanvasTexture(glowCanvas);
+glowTex.colorSpace = THREE.SRGBColorSpace;
+const glowSprite = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: glowTex,
+  color: 0xffc078,
+  transparent: true,
+  opacity: 0.75,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  depthTest: true
+}));
+root.add(glowSprite);
+
+/* 火焰点光源 */
+const flameLight = new THREE.PointLight(0xffa040, 0, 3.0, 2.0);
+root.add(flameLight);
+
+/* ---------------- 4.5 蜡泪（固定种子的伪随机分布） ---------------- */
+const DRIPS = 9;
+const dripGeo = new THREE.SphereGeometry(1, 12, 9);
+const dripMeshes = [];
+const dripData = [];
+const rndDrip = mulberry32(20240607);
+for (let i = 0; i < DRIPS; i++) {
+  dripMeshes.push(new THREE.Mesh(dripGeo, waxMat));
+  dripData.push({
+    ang: (i / DRIPS) * Math.PI * 2 + rndDrip() * 0.5,
+    hFrac: 0.30 + rndDrip() * 0.58,
+    len: 0.55 + rndDrip() * 0.95,
+    phase: rndDrip()
+  });
+  root.add(dripMeshes[i]);
+}
+
+/* ---------------- 4.6 烟雾 ---------------- */
+const SMOKE_N = 40;
+const smokeGeo = new THREE.BufferGeometry();
+const smokePos = new Float32Array(SMOKE_N * 3);
+const smokeSize = new Float32Array(SMOKE_N);
+const smokeAlpha = new Float32Array(SMOKE_N);
+const rndSmoke = mulberry32(987654321);
+for (let i = 0; i < SMOKE_N; i++) {
+  const u = i / (SMOKE_N - 1);
+  const a = rndSmoke() * Math.PI * 2;
+  const rad = 0.010 + Math.pow(u, 1.25) * 0.30;
+  const jx = (rndSmoke() - 0.5) * 0.05;
+  const jz = (rndSmoke() - 0.5) * 0.05;
+  smokePos[i * 3]     = Math.cos(a) * rad + jx;
+  smokePos[i * 3 + 1] = u * 1.15 + 0.02;
+  smokePos[i * 3 + 2] = Math.sin(a) * rad + jz;
+  smokeSize[i] = 0.045 + u * 0.17;
+  smokeAlpha[i] = (1.0 - u) * 0.85;
+}
+smokeGeo.setAttribute('position', new THREE.BufferAttribute(smokePos, 3));
+smokeGeo.setAttribute('aSize', new THREE.BufferAttribute(smokeSize, 1));
+smokeGeo.setAttribute('aAlpha', new THREE.BufferAttribute(smokeAlpha, 1));
+
+const smokeMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uOpacity: { value: 0 },
+    uColor: { value: new THREE.Color(0xb6bccd) },
+    uScale: { value: 800.0 }
+  },
+  vertexShader: /* glsl */`
+    attribute float aSize;
+    attribute float aAlpha;
+    varying float vA;
+    uniform float uScale;
+    void main() {
+      vA = aAlpha;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      gl_PointSize = aSize * uScale / max(0.001, -mv.z);
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    varying float vA;
+    uniform float uOpacity;
+    uniform vec3 uColor;
+    void main() {
+      vec2 p = gl_PointCoord - 0.5;
+      float d = length(p);
+      float a = smoothstep(0.5, 0.06, d);
+      gl_FragColor = vec4(uColor, a * vA * uOpacity * 0.55);
+    }
+  `,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.NormalBlending
+});
+const smoke = new THREE.Points(smokeGeo, smokeMat);
+root.add(smoke);
+
+/* =========================================================================
+   5. 每帧（严格由 t 决定）的场景更新
+   ========================================================================= */
+function updateScene(tt) {
+  const H        = P.H(tt);
+  const R        = P.R(tt);
+  const dish     = Math.min(P.dish(tt), H * 0.42);
+  const hex      = P.hex(tt);
+  const gold     = P.gold(tt);
+  const roundTop = P.roundTop(tt);
+  const poolR    = P.poolR(tt);
+  const poolH    = P.poolH(tt);
+  const drips    = P.drips(tt);
+  const flameP   = P.flame(tt);
+  const wickP    = P.wick(tt);
+  const smokeP   = P.smoke(tt);
+
+  /* ---- 蜡的材质颜色 ---- */
+  waxColor.copy(COL_WHITE).lerp(COL_HONEY, gold);
+  waxMat.color.copy(waxColor);
+  waxMat.roughness = 0.38 + 0.30 * gold;
+  waxMat.emissive.setRGB(0.10 * flameP, 0.048 * flameP, 0.014 * flameP);
+
+  /* ---- 主体形变 ---- */
+  rebuildBody(H, R, dish, roundTop, hex);
+
+  /* ---- 整体姿态（旋转角仅由 t 决定） ---- */
+  root.position.y = -H * 0.5;
+  root.rotation.y = 0.50 + 0.26 * tt;
+
+  /* ---- 顶部与烛芯 ---- */
+  const surfaceY = H - dish;
+  const wickLen = 0.02 + 0.19 * wickP;
+  const wickTopY = surfaceY - 0.010 + wickLen;
+
+  wick.visible = wickP > 0.02;
+  wick.scale.set(1, Math.max(wickLen, 0.001), 1);
+  wick.position.set(0, surfaceY - 0.012, 0);
+
+  wickTip.visible = wickP > 0.05;
+  wickTip.position.set(0, wickTopY - 0.006, 0);
+  wickTip.scale.setScalar(0.7 + 0.7 * wickP);
+
+  /* ---- 火焰 ---- */
+  const fs = 0.32 + 0.68 * flameP;
+  flame.position.set(0, wickTopY + 0.02, 0);
+  flame.scale.set(0.17 * fs, 0.52 * fs, 0.17 * fs);
+  flame.visible = flameP > 0.004;
+  flameMat.uniforms.uIntensity.value = flameP;
+  flameMat.uniforms.uWobble.value = tt * 6.0;
+
+  glowSprite.position.set(0, wickTopY + 0.16 * fs, 0);
+  const gs = 0.55 + 0.85 * flameP;
+  glowSprite.scale.set(gs, gs, 1);
+  glowSprite.material.opacity = 0.72 * flameP;
+  glowSprite.visible = flameP > 0.01;
+
+  flameLight.position.set(0, wickTopY + 0.14, 0);
+  flameLight.intensity = flameP * 1.8;
+  flameLight.visible = flameP > 0.01;
+
+  /* ---- 蜡泪 ---- */
+  for (let i = 0; i < DRIPS; i++) {
+    const d = dripData[i];
+    const appear = clamp01((drips - 0.12 * d.phase) / 0.62);
+    const m = dripMeshes[i];
+    if (appear <= 0.008) { m.visible = false; continue; }
+    m.visible = true;
+    const ry = (0.055 + 0.105 * d.len) * appear;
+    const rx = 0.042 * appear * (0.65 + 0.55 * d.len);
+    const ang = d.ang;
+    const hexF = 1 + hex * 0.12 * Math.cos(6 * ang);
+    const rr = R * hexF * 0.99;
+    const yy = Math.min(surfaceY * 0.97, d.hFrac * H);
+    m.position.set(Math.cos(ang) * rr, yy, Math.sin(ang) * rr);
+    m.scale.set(rx, ry, rx);
+  }
+
+  /* ---- 底部蜡池 ---- */
+  if (poolR > 0.006 && poolH > 0.001) {
+    pool.visible = true;
+    updatePool(poolR, poolH);
+  } else {
+    pool.visible = false;
+  }
+
+  /* ---- 烟 ---- */
+  smoke.visible = smokeP > 0.01;
+  smoke.position.set(0, wickTopY + 0.02, 0);
+  smokeMat.uniforms.uOpacity.value = smokeP;
+  smokeMat.uniforms.uScale.value =
+    (window.innerHeight * (window.devicePixelRatio || 1)) /
+    (2 * Math.tan(camera.fov * 0.5 * Math.PI / 180));
+}
+
+/* =========================================================================
+   6. UI / 交互
+   ========================================================================= */
+const sliderEl = document.getElementById('slider');
+const nameEl = document.getElementById('stageName');
+
+function syncUI() {
+  if (EMBED) return;
+  if (sliderEl) sliderEl.value = String(t);
+  if (nameEl) {
+    let label = STAGES[0].name;
+    for (let i = 0; i < STAGES.length; i++) {
+      if (t >= STAGES[i].t - 1e-6) label = STAGES[i].name;
+    }
+    nameEl.textContent = label;
+  }
+}
+
+if (!EMBED) {
+  sliderEl.addEventListener('input', (e) => window.setTime(parseFloat(e.target.value)));
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft')  { window.setTime(t - 0.01); e.preventDefault(); }
+    if (e.key === 'ArrowRight') { window.setTime(t + 0.01); e.preventDefault(); }
+  });
+}
+
+/* =========================================================================
+   7. 尺寸自适应 + 主循环
+   ========================================================================= */
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h);
+  updateCamera();
+  smokeMat.uniforms.uScale.value =
+    (h * (window.devicePixelRatio || 1)) /
+    (2 * Math.tan(camera.fov * 0.5 * Math.PI / 180));
+  if (ready) {
+    renderer.render(scene, camera);
+  }
+}
+window.addEventListener('resize', onResize);
+
+let lastNow = 0, fpsAcc = 0, fpsFrames = 0;
+
+function animate(now) {
+  requestAnimationFrame(animate);
+  if (lastNow > 0) {
+    const dt = now - lastNow;
+    if (dt > 0 && dt < 1000) {
+      fpsAcc += dt; fpsFrames++;
+      if (fpsAcc > 500) {
+        fps = Math.round((1000 * fpsFrames) / fpsAcc);
+        fpsAcc = 0; fpsFrames = 0;
+      }
+    }
+  }
+  lastNow = now;
+  renderer.render(scene, camera);
+}
+
+/* ---- 启动 ---- */
+updateScene(t);
+renderer.render(scene, camera);
+syncUI();
+ready = true;
+
+requestAnimationFrame(animate);
+
+/* ---- 通知宿主页面阶段列表（唯一对外通信） ---- */
+try {
+  window.parent.postMessage({ type: 'timespell:stages', stages: window.getStages() }, '*');
+} catch (err) { /* ignore */ }
+</script>
+</body>
+</html>

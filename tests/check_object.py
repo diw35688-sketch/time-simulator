@@ -1,0 +1,84 @@
+"""时间物品自动验收，对照 prompts/object_task.md 的验收标准。不需要启动 server.py。
+用法：python tests/check_object.py objects/apple3d.html
+"""
+import asyncio, io, json, sys
+import numpy as np
+from PIL import Image
+from playwright.async_api import async_playwright
+from _static import BASE, serve
+
+PATH = sys.argv[1].replace(chr(92), '/').lstrip('./')
+W, H = 1280, 720
+
+
+async def check(b, mode):
+    ctx = await b.new_context(viewport={'width': W, 'height': H})
+    await serve(ctx)
+    pg = await ctx.new_page()
+    errs, external = [], []
+    pg.on('pageerror', lambda e: errs.append(str(e)[:200]))
+    pg.on('console', lambda m: m.type == 'error' and errs.append(m.text[:200]))
+    pg.on('request', lambda r: not r.url.startswith((BASE, 'data:', 'blob:')) and external.append(r.url[:100]))
+    await pg.goto(f'{BASE}/{PATH}{mode}')
+    try:
+        await pg.wait_for_function('typeof window.setTime === "function"', timeout=20000)
+    except Exception:
+        await ctx.close()
+        return {'FATAL': 'setTime 不存在', 'errors': errs}
+    await pg.wait_for_timeout(1500)
+
+    async def shot(t):
+        await pg.evaluate(f'window.setTime({t})')
+        await pg.wait_for_timeout(350)
+        return np.asarray(Image.open(io.BytesIO(await pg.screenshot(omit_background=True))).convert('RGBA')).astype(int)
+
+    a = await shot(0.7); await shot(-0.5); c = await shot(0.7)
+    m1, z, p1 = await shot(-1), await shot(0), await shot(1)
+    r = {'canvas_count': await pg.evaluate("document.querySelectorAll('canvas').length"), 'errors': errs, 'external_requests': external,
+         'fps': round((await pg.evaluate('window.__timeState?.().fps')) or 0),
+         'purity_px_changed%': round((np.abs(a - c).max(2) > 2).mean() * 100, 3),
+         'diff_-1_vs_0': round(float(np.abs(m1[..., :3] - z[..., :3]).mean()), 2), 'diff_+1_vs_0': round(float(np.abs(p1[..., :3] - z[..., :3]).mean()), 2),
+         'stages': await pg.evaluate('window.getStages ? window.getStages().map(s => s.t + ":" + s.name) : null')}
+    await pg.evaluate("window.postMessage({ type: 'timespell:setTime', t: 0.33 }, '*')")
+    await pg.wait_for_timeout(200)
+    r['postMessage_ok'] = abs(await pg.evaluate('window.getTime()') - .33) < 1e-6
+    await pg.evaluate('window.setTime(5)')
+    r['clamp_ok'] = await pg.evaluate('window.getTime()') == 1
+    if mode:
+        r['corner_alpha_max'] = int(max(z[:10, :10, 3].max(), z[:10, -10:, 3].max(), z[-10:, :10, 3].max(), z[-10:, -10:, 3].max()))
+        r['visible_ui'] = await pg.evaluate("[...document.body.querySelectorAll('*')].filter(e => !['CANVAS','SCRIPT','STYLE'].includes(e.tagName) && e.offsetParent !== null && e.getBoundingClientRect().width > 0).map(e => e.tagName + '#' + e.id).slice(0, 5)")
+        ys, xs = np.where(z[..., 3] > 40)
+        if len(xs):
+            r['t0_center'] = [round((xs.min() + xs.max()) / 2), round((ys.min() + ys.max()) / 2)]
+            r['t0_size'] = int(max(xs.max() - xs.min(), ys.max() - ys.min()))
+        else:
+            r['t0_center'] = None
+        r['expected'] = {'center': [W * .5, H * .6], 'size': round(min(W, H) * .35)}
+    await ctx.close()
+    return r
+
+
+def verdict(s, e):
+    ok = lambda cond: '通过' if cond else '不通过'
+    out = {
+        '1 无报错': ok(not s.get('errors') and not e.get('errors') and 'FATAL' not in s and 'FATAL' not in e),
+        '2 帧率≥30': ok(min(s.get('fps', 0), e.get('fps', 0)) >= 30),
+        '3 纯函数（往回拨逐像素复原）': ok(s.get('purity_px_changed%') == 0 and e.get('purity_px_changed%') == 0),
+        '4 嵌入模式透明、无 UI': ok(e.get('corner_alpha_max') == 0 and not e.get('visible_ui') and e.get('t0_center') is not None),
+        '5 过去/现在/未来明显不同': ok(min(e.get('diff_-1_vs_0', 0), e.get('diff_+1_vs_0', 0)) > 0.5),
+        '6 无外部请求': ok(not s.get('external_requests') and not e.get('external_requests')),
+        '接口 postMessage / 截断': ok(s.get('postMessage_ok') and s.get('clamp_ok')),
+    }
+    return out
+
+
+async def main():
+    async with async_playwright() as p:
+        b = await p.chromium.launch(args=['--use-gl=angle', '--enable-unsafe-swiftshader'])
+        s, e = await check(b, ''), await check(b, '?embed=1')
+        await b.close()
+    v = verdict(s, e)
+    print(json.dumps({'standalone': s, 'embed': e, 'verdict': v}, ensure_ascii=False, indent=1))
+    sys.exit(0 if all(x == '通过' for x in v.values()) else 1)
+
+asyncio.run(main())
