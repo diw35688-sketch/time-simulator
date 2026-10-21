@@ -1,0 +1,7 @@
+.git
+.env
+tests/
+**/__pycache__
+objects/user/
+*.raw.md
+*.response.json

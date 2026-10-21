@@ -12,7 +12,7 @@ AUTH = {'base': conf['base'], 'key': conf['key']}
 
 
 def post(path, obj):
-    req = urllib.request.Request(B + path, data=json.dumps(obj).encode(), method='POST', headers={'Content-Type': 'application/json'})
+    req = urllib.request.Request(B + path, data=json.dumps(obj).encode(), method='POST', headers={'Content-Type': 'application/json', 'X-Timespell': '1'})
     try:
         return urllib.request.urlopen(req, timeout=120)
     except urllib.error.HTTPError as e:

@@ -40,7 +40,16 @@ const params = new URLSearchParams(location.search);
 const OBJECT_URL = params.get('object');
 const USE_CAM = params.get('nocam') === null;
 const GLOW = '#1dff5e', CORE = '#dcffe6';
-const banner = msg => { const b = document.getElementById('banner'); b.textContent = msg; b.style.display = msg ? 'block' : 'none'; };
+const banner = (msg, link) => {
+  const b = document.getElementById('banner');
+  b.textContent = msg;
+  if (link) {
+    const a = Object.assign(document.createElement('a'), { href: link.href, target: '_blank', rel: 'noopener', textContent: link.text });
+    a.style.cssText = 'color:#9dffbe;margin-left:10px;text-decoration:underline';
+    b.appendChild(a);
+  }
+  b.style.display = msg ? 'block' : 'none';
+};
 
 if (location.protocol === 'file:') banner('当前是双击打开的文件，浏览器不允许调用摄像头。请双击 start.bat，或打开 http://127.0.0.1:8765/');
 
@@ -317,7 +326,9 @@ async function startCamera() {
     const why = { NotAllowedError: '摄像头权限被拒绝，请点地址栏左侧的图标允许摄像头后刷新',
       NotReadableError: '摄像头被其他程序占用（ToDesk、微信视频、会议软件等），关掉后刷新',
       NotFoundError: '没有检测到摄像头' }[err.name] || `摄像头启动失败：${err.name} ${err.message}`;
-    banner(why + '。当前可用鼠标 + 滚轮体验。');
+    // 嵌在别的网页里（比如魔搭创空间的页面）时，外层可能不允许 iframe 用摄像头：给一个新窗口打开的入口
+    const framed = window.self !== window.top && ['NotAllowedError', 'SecurityError'].includes(err.name);
+    banner(why + '。当前可用鼠标 + 滚轮体验。', framed ? { href: location.href, text: '在新窗口打开就能用摄像头' } : null);
     handStatus = '摄像头不可用'; video.style.display = 'none';
     return;
   }

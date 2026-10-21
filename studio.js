@@ -6,6 +6,10 @@ const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; 
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// 调本服务接口时带上自定义头：server.py 据此拒绝别的网站发来的跨站请求
+const API_HEADERS = { 'Content-Type': 'application/json', 'X-Timespell': '1' };
+const LS_MINE = 'timespell.mine';   // 在线版：自己生成的物品只记在自己的浏览器里
+let isPublic = false;
 const ai = Object.assign({ base: 'https://api.deepseek.com', key: '', model: 'deepseek-chat', maxTokens: 64000 }, load(LS_AI, {}));
 
 document.head.insertAdjacentHTML('beforeend', `<style>
@@ -42,6 +46,7 @@ document.body.insertAdjacentHTML('beforeend', `
   <h3>当前物品</h3>
   <select id="stObj"></select>
   <div class="note" id="stObjNote" style="white-space: pre-line"></div>
+  <div class="row"><button class="b ghost" id="stDl" type="button">下载当前物品的 HTML</button></div>
 
   <h3>AI 接口（兼容 OpenAI 格式）</h3>
   <label for="stBase">API 地址</label>
@@ -53,14 +58,14 @@ document.body.insertAdjacentHTML('beforeend', `
   <label for="stMax">最大输出 token（带思考的模型要给足，建议 64000 以上）</label>
   <input id="stMax" type="number" min="4000" step="1000">
   <div class="row"><button class="b" id="stTest" type="button">测试连接</button><button class="b ghost" id="stSave" type="button">保存</button></div>
-  <div class="note">Key 只保存在这台电脑的浏览器里，经本机 server.py 转发给你填写的地址，不会写进项目文件。生成的物品运行在沙箱里，读不到 Key。</div>
+  <div class="note" id="stKeyNote">Key 只保存在这台电脑的浏览器里，经本机 server.py 转发给你填写的地址，不会写进项目文件。生成的物品运行在沙箱里，读不到 Key。</div>
   <div class="status" id="stApiStatus"></div>
 
   <h3>生成新物品</h3>
   <label for="stDesc">描述你的物品，以及它的过去和未来（可选）</label>
   <textarea id="stDesc" placeholder="例如：一根点燃的白蜡烛。过去：蜂巢 → 蜡块 → 新蜡烛；未来：越烧越短 → 蜡泪堆积 → 熄灭冒烟"></textarea>
   <div class="row"><button class="b" id="stGen" type="button">生成</button><button class="b ghost" id="stStop" type="button" disabled>取消</button></div>
-  <div class="note">一次生成约 1–5 分钟，取决于模型是否带思考过程。生成的文件保存在 objects/user/，可以直接分享或提交到仓库。</div>
+  <div class="note" id="stGenNote">一次生成约 1–5 分钟，取决于模型是否带思考过程。生成的文件保存在 objects/user/，可以直接分享或提交到仓库。</div>
   <div class="status" id="stGenStatus"></div>
 </div>`);
 
@@ -81,7 +86,10 @@ async function refreshObjects(selectId) {
   if (!list) {
     try { list = { builtin: await (await fetch('objects/index.json')).json(), user: [] }; } catch { list = { builtin: [], user: [] }; }
   }
-  objects = [...list.builtin.map(o => ({ ...o, group: '内置' })), ...list.user.map(o => ({ ...o, group: '我生成的' }))];
+  isPublic = !!list.public;
+  const mine = isPublic ? load(LS_MINE, []).filter(o => Date.now() - (o.savedAt || 0) < 7 * 864e5) : list.user;
+  objects = [...list.builtin.map(o => ({ ...o, group: '内置' })), ...mine.map(o => ({ ...o, group: '我生成的' }))];
+  applyModeNotes();
   const groups = ['内置', '我生成的'].map(g => {
     const items = objects.filter(o => o.group === g);
     return items.length ? `<optgroup label="${g}">${items.map(o => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('')}</optgroup>` : '';
@@ -89,6 +97,11 @@ async function refreshObjects(selectId) {
   $('stObj').innerHTML = groups.join('');
   const want = selectId || load(LS_OBJ, 'apple3d');
   $('stObj').value = objects.some(o => o.id === want) ? want : objects[0]?.id;
+}
+function applyModeNotes() {
+  if (!isPublic) return;
+  $('stKeyNote').textContent = '在线版：Key 只保存在你的浏览器里，生成时经本站服务器转发给你填写的地址（不保存、不记录），只能转发到常见的 AI 服务。介意的话可以下载源码在本地运行。';
+  $('stGenNote').textContent = '在线版生成的物品只出现在你自己的列表里，7 天后清理；想长期保留，点上面的「下载当前物品的 HTML」。每小时有次数限制。';
 }
 function applyObject() {
   const o = objects.find(x => x.id === $('stObj').value);
@@ -98,6 +111,21 @@ function applyObject() {
   ts.setObject(o);
 }
 $('stObj').onchange = applyObject;
+$('stDl').onclick = async () => {
+  const o = objects.find(x => x.id === $('stObj').value);
+  if (!o) return;
+  try {
+    const r = await fetch(o.src);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([await r.text()], { type: 'text/html' }));
+    a.download = String(o.name || o.id).replace(/[^\w一-龥-]+/g, '_') + '.html';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) {
+    $('stObjNote').textContent = '下载失败：' + e.message + (isPublic ? '（在线版生成的物品可能已经过期清理）' : '');
+  }
+};
 
 // ---------- AI 设置 ----------
 function fillAi() { $('stBase').value = ai.base; $('stKey').value = ai.key; $('stModel').value = ai.model; $('stMax').value = ai.maxTokens; }
@@ -111,14 +139,14 @@ $('stTest').onclick = async () => {
   readAi();
   status($('stApiStatus'), '连接中…');
   try {
-    const r = await fetch('api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ base: ai.base, key: ai.key }) });
+    const r = await fetch('api/models', { method: 'POST', headers: API_HEADERS, body: JSON.stringify({ base: ai.base, key: ai.key }) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
     const ids = (d.data || []).map(m => m.id).filter(Boolean);
     $('stModels').innerHTML = ids.map(id => `<option value="${esc(id)}">`).join('');
     // 有的网关模型列表不需要 Key，再发一个最小对话请求，才能确认 Key 和模型都可用
     status($('stApiStatus'), `找到 ${ids.length} 个模型，正在验证 Key 和模型…`);
-    const c = await fetch('api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const c = await fetch('api/chat', { method: 'POST', headers: API_HEADERS,
       body: JSON.stringify({ base: ai.base, key: ai.key, body: { model: ai.model, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] } }) });
     const cd = await c.json().catch(() => ({}));
     if (!c.ok) throw new Error(`模型「${ai.model}」调用失败：${String(cd.error || 'HTTP ' + c.status).slice(0, 300)}`);
@@ -146,7 +174,7 @@ function checkHtml(html) {
 // 流式调用模型，返回最终正文；onProgress(思考字数, 正文字数)
 async function callModel(messages, onProgress) {
   const body = { model: ai.model, max_tokens: ai.maxTokens, stream: true, messages };
-  const r = await fetch('api/chat', { method: 'POST', signal: abort.signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ base: ai.base, key: ai.key, body }) });
+  const r = await fetch('api/chat', { method: 'POST', signal: abort.signal, headers: API_HEADERS, body: JSON.stringify({ base: ai.base, key: ai.key, body }) });
   if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || 'HTTP ' + r.status); }
   let reasoning = 0, content = '', finish = '';
   if ((r.headers.get('Content-Type') || '').includes('json')) {
@@ -240,9 +268,10 @@ async function generate() {
       }
     }
     const name = desc.split(/[。.,，\n]/)[0].slice(0, 20) || '新物品';
-    const sr = await fetch('api/objects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, html, prompt: desc, model: ai.model }) });
+    const sr = await fetch('api/objects', { method: 'POST', headers: API_HEADERS, body: JSON.stringify({ name, html, prompt: desc, model: ai.model }) });
     const saved = await sr.json();
     if (!sr.ok) throw new Error(saved.error || '保存失败');
+    if (isPublic) save(LS_MINE, [{ id: saved.id, name, src: saved.src, prompt: desc, model: ai.model, savedAt: Date.now() }, ...load(LS_MINE, [])].slice(0, 50));
     await refreshObjects(saved.id); applyObject();
     const note = content.slice(content.lastIndexOf('```') + 3).trim().slice(0, 300);
     status(st, [`完成，用时 ${sec()}s，已载入「${name}」`, note, ...fixes.map(f => '已修正：' + f), ...warns.map(w => '注意：' + w)].filter(Boolean).join('\n'), warns.length ? '' : 'ok');

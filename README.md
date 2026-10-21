@@ -56,7 +56,7 @@ python server.py            # Windows 也可以直接双击 start.bat，第一�
 
 - 带思考过程的模型，要把「最大输出 token」设到 64000 以上，不然思考过程会把额度用光、一行代码都写不出来。内置物品是用 DeepSeek V4.1 Flash 生成的，每个 3–5 分钟。
 - AI 写的物品经常有一处低级错误，比如忘了把画布加进页面、代码里混进乱码。内置的 3 个物品每个都人工修过一处，记录在 `objects/index.json` 里。生成后看不到东西，就跑一下下面的验收脚本。
-- **Key 的安全**：Key 只保存在你浏览器的 localStorage 里，由本机的 `server.py` 转发给你填的地址，不会写进任何文件；`server.py` 只监听 127.0.0.1。物品运行在沙箱 iframe 里，拿不到页面的存储，读不到 Key。
+- **Key 的安全**：Key 只保存在你浏览器的 localStorage 里，由本机的 `server.py` 转发给你填的地址，不会写进任何文件。`server.py` 只监听 127.0.0.1，只对外提供页面需要的文件，接口要带自定义请求头，别的网站调用不了。物品运行在沙箱 iframe 里，拿不到页面的存储，读不到 Key。
 
 想用命令行批量生成，可以用 `tools/td.py`，配置方法见 `.env.example`。
 
@@ -92,7 +92,20 @@ python server.py            # Windows 也可以直接双击 start.bat，第一�
 
 法阵、手感、声音方面的改进，也欢迎提 issue 或 PR。
 
-其他测试：`tests/check_mouse.py` 测法阵和物品联动（加 `--fresh` 只用 git 里的文件，模拟刚 clone 的仓库），`tests/check_cam.py` 用虚拟摄像头测模型加载。`check_server.py`、`check_studio.py`、`check_repair.py` 会调用真实的 AI 接口，需要先运行 `server.py` 并配置 `.env`。
+其他测试：`tests/check_server_security.py` 测服务的安全限制（加 `--public` 测在线版），`tests/check_mouse.py` 测法阵和物品联动（加 `--fresh` 只用 git 里的文件，模拟刚 clone 的仓库），`tests/check_cam.py` 用虚拟摄像头测模型加载。`check_server.py`、`check_studio.py`、`check_repair.py` 会调用真实的 AI 接口，需要先运行 `server.py` 并配置 `.env`。
+
+## 部署到魔搭创空间
+
+仓库里带了 `Dockerfile` 和 `ms_deploy.json`，可以部署成魔搭的 Docker 创空间。用免费的 2 核 16G CPU 实例就够，手势识别和渲染都在访问者自己的浏览器里跑。
+
+```bash
+pip install modelscope
+modelscope login --token 你的访问令牌   # 令牌在 https://modelscope.cn/my/myaccesstoken
+python download_models.py               # 模型文件要一起传上去
+python tools/deploy_modelscope.py 你的魔搭用户名/time-simulator
+```
+
+脚本会打包当前提交和模型文件（超过 4MB 的拆成几块，构建时再拼回去），推送到创空间仓库并触发部署。在线版以公开模式运行（`TIMESPELL_PUBLIC=1`）：只转发到常见的 AI 服务，按 IP 限流；访问者生成的物品用随机文件名保存，7 天后清理，不会出现在别人的列表里。
 
 ## 常见问题
 
@@ -108,13 +121,14 @@ python server.py            # Windows 也可以直接双击 start.bat，第一�
 ```
 index.html              宿主页面：摄像头、手势识别、法阵、声音
 studio.js               设置面板：物品选择、AI 接口、一句话生成和自动修复
-server.py               本地服务：静态文件、AI 接口转发、保存生成的物品
+server.py               服务：静态文件、AI 接口转发、保存生成的物品（TIMESPELL_PUBLIC=1 是在线版）
+Dockerfile              魔搭创空间等平台的部署配置（配合 ms_deploy.json）
 download_models.py      把 MediaPipe 运行文件和模型下载到 vendor/mediapipe
 prompts/object_task.md  生成物品的提示词模板，也是物品规范
 objects/                内置物品，index.json 是物品清单
 objects/user/           你生成的物品（不进仓库）
 tests/                  自动验收和回归测试（Playwright）
-tools/                  命令行生成（td.py）、录制演示动图（record_demo.py）
+tools/                  命令行生成（td.py）、录制演示动图（record_demo.py）、部署到魔搭（deploy_modelscope.py）
 vendor/                 three.js r160、acorn
 ```
 
