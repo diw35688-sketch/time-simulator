@@ -66,14 +66,19 @@ export function handFeatures(lm, map) {
 
 export const TRACK_DEFAULTS = {
   pos: [1.0, 0.02, 2.0],      // OneEuro：静止时的截止频率 Hz、随速度提高截止频率的系数、速度估计的截止频率
-  len: [0.6, 0.003, 1.0],
+  len: [2.0, 0.06, 2.0],      // 手掌长度决定法阵大小：手往镜头前推、往后撤时要跟得上
   roll: [3.0, 0.4, 2.0],
   lead: 0.55, maxLead: 80, velK: 0.5,   // 按速度外推到“现在”，抵消识别延迟（ms）
   leadMinSpeed: 25, leadRamp: 100,   // px/s：慢于这个速度不外推，免得放大静止时的抖动
-  tauPos: 0.024, tauRoll: 0.02, tauSlow: 0.06,
+  tauPos: 0.024, tauRoll: 0.02, tauLen: 0.02, tauSlow: 0.06,
   grace: 220, reset: 450,     // ms：短暂丢失时继续沿用；超过 reset 就当成新的一只手
   openOn: 1.55, openOff: 1.25, openFrames: 2,
   rollJump: 0.8,              // rad：两帧之间转动超过这个角度当成识别错误
+  // 前臂：方向 = 手指方向的反方向 + 手腕弯曲角。弯曲角、前臂长度、前臂朝镜头倾斜的角度来自姿态识别（手肘），
+  // 它们变化慢，单独平滑；前臂方向本身跟着手的转角实时走，所以不会被姿态识别的速度拖慢
+  armRatio: 2.6,             // 前臂长 / 手掌长（三维）
+  armTilt: 0.6,              // rad：没有姿态识别时，假设前臂往镜头里倾斜的角度
+  maxBend: 1.1, tauBend: 0.12, poseHold: 1500,
 };
 
 function newSlot(k, p) {
@@ -81,9 +86,10 @@ function newSlot(k, p) {
     id: k, pref: k === 0 ? 'Left' : 'Right',   // MediaPipe 按镜像画面判断左右，送进去的是原始画面，它说的 Left 是用户的右手
     active: false, seen: false, lastTs: -Infinity, epoch: 0, open: false, openRatio: 0, openRun: 0,
     cx: new Channel(p.pos, p.velK), cy: new Channel(p.pos, p.velK), len: new Channel(p.len), roll: new Channel(p.roll),
-    rollPrev: 0, rollU: 0, rollGlitch: 0, n: [0, 0, 1], up: [0, 1, 0], wo: [0, 0], S: null,
-    arm: null, armTs: -Infinity,
-    d: { init: false, x: 0, y: 0, roll: 0, len: 0, n: [0, 0, 1], up: [0, 1, 0], wx: 0, wy: 0, arm: [0, 1], armLen: 0, armOk: false },
+    rollPrev: 0, rollU: 0, rollGlitch: 0, n: [0, 0, 1], up: [0, 1, 0], S: null, hist: [],
+    woR: 0.55, woA: Math.PI,   // 手腕相对手掌中心的位置：距离（手掌长的倍数）、相对手指方向的角度
+    bend: 0, ratio2D: p.armRatio * Math.cos(p.armTilt), tilt: p.armTilt, poseTs: -Infinity,
+    d: { init: false, x: 0, y: 0, roll: 0, len: 0, n: [0, 0, 1], up: [0, 1, 0], wx: 0, wy: 0, bend: 0, arm: [0, 1], armLen: 0, armTilt: p.armTilt, armOk: false },
   };
 }
 
@@ -136,7 +142,8 @@ export class HandTracker {
       for (const c of [s.cx, s.cy, s.len, s.roll]) c.reset();
       s.epoch++; s.d.init = false; s.rollPrev = f.roll; s.rollGlitch = 0;
       s.openRatio = f.open; s.open = f.open > (p.openOn + p.openOff) / 2; s.openRun = 0;
-      s.n = f.n; s.up = f.up;
+      s.n = f.n; s.up = f.up; s.hist = [];
+      s.bend = 0; s.ratio2D = p.armRatio * Math.cos(p.armTilt); s.tilt = p.armTilt; s.poseTs = -Infinity;
     }
     s.active = true; s.lastTs = ts; s.S = f.S;
     s.cx.push(f.x, dt); s.cy.push(f.y, dt); s.len.push(f.len, dt);
@@ -153,7 +160,12 @@ export class HandTracker {
     }
     const k = fresh ? 1 : 1 - Math.exp(-dt / 0.08);
     s.n = nlerp3(s.n, f.n, k); s.up = nlerp3(s.up, f.up, k);
-    s.wo = fresh ? [f.S[0][0] - f.x, f.S[0][1] - f.y] : [s.wo[0] + (f.S[0][0] - f.x - s.wo[0]) * k, s.wo[1] + (f.S[0][1] - f.y - s.wo[1]) * k];
+    // 手腕位置记成相对手掌的极坐标（距离 / 手掌长、相对手指方向的角度），画的时候按当前转角和大小还原，转手时手腕跟着转
+    const wox = f.S[0][0] - f.x, woy = f.S[0][1] - f.y;
+    const woR = Math.hypot(wox, woy) / f.len, woA = angDiff(Math.atan2(woy, wox), f.roll);
+    s.woR = fresh ? woR : s.woR + (woR - s.woR) * k;
+    s.woA = fresh ? woA : s.woA + angDiff(woA, s.woA) * k;
+    s.hist.push([ts, f.roll]); if (s.hist.length > 12) s.hist.shift();
     // 张开/握拳：比例先平滑，再加迟滞，连续几帧都一样才切换，避免单帧误判
     s.openRatio = fresh ? f.open : s.openRatio + (f.open - s.openRatio) * (1 - Math.exp(-dt / 0.05));
     const want = s.openRatio > p.openOn ? true : s.openRatio < p.openOff ? false : s.open;
@@ -168,6 +180,7 @@ export class HandTracker {
   }
 
   bindArms(arms, ts, slots) {
+    const p = this.p;
     for (const s of slots) {
       const w = s.S[0];
       let best = null, bd = s.len.x * 2.5;
@@ -178,7 +191,18 @@ export class HandTracker {
       if (!best) continue;
       const dx = best.elbow[0] - best.wrist[0], dy = best.elbow[1] - best.wrist[1], l = Math.hypot(dx, dy);
       if (l < 1) continue;
-      s.arm = { dir: [dx / l, dy / l], len: l }; s.armTs = ts;
+      // 和这一帧姿态同一时刻的手的转角（姿态识别和手势识别不一定是同一帧）
+      let roll = s.rollPrev, near = Infinity;
+      for (const [t, r] of s.hist) if (Math.abs(t - ts) < near) { near = Math.abs(t - ts); roll = r; }
+      const bend = angDiff(Math.atan2(dy, dx), roll + Math.PI);
+      if (Math.abs(bend) > p.maxBend) continue;   // 弯得太离谱，多半是把别的手臂认成了这只手的
+      const ratio = l / Math.max(s.len.x, 1);
+      const tilt = clamp(Math.acos(clamp(ratio / p.armRatio, 0.25, 1)), 0.35, 1.25);
+      const k = s.poseTs === -Infinity ? 1 : 1 - Math.exp(-clamp(ts - s.poseTs, 0, 500) / 1000 / p.tauBend);
+      s.bend += angDiff(bend, s.bend) * k;
+      s.ratio2D += (ratio - s.ratio2D) * k;
+      s.tilt += (tilt - s.tilt) * k;
+      s.poseTs = Math.max(s.poseTs, ts);
     }
   }
 
@@ -193,23 +217,26 @@ export class HandTracker {
       const gate = clamp((Math.hypot(s.cx.v, s.cy.v) - p.leadMinSpeed) / p.leadRamp, 0, 1);
       const lead = c => Math.min(Math.max(age, 0) + c.lag * 1000, p.maxLead) / 1000 * p.lead * gate;
       const tx = s.cx.x + s.cx.v * lead(s.cx), ty = s.cy.x + s.cy.v * lead(s.cy);
-      const d = s.d, armTarget = () => (s.arm && now - s.armTs < 600 ? s.arm.dir : [-Math.cos(d.roll), -Math.sin(d.roll)]);
+      const d = s.d;
       if (!d.init) {
-        Object.assign(d, { init: true, x: tx, y: ty, roll: s.roll.x, len: s.len.x, n: s.n, up: s.up });
-        d.arm = armTarget(); d.armLen = s.arm ? s.arm.len : d.len * 2.2;
+        Object.assign(d, { init: true, x: tx, y: ty, roll: s.roll.x, len: s.len.x, n: s.n, up: s.up, bend: s.bend });
       } else {
         d.x += (tx - d.x) * k(p.tauPos); d.y += (ty - d.y) * k(p.tauPos);
         d.roll += (s.roll.x - d.roll) * k(p.tauRoll);
-        d.len += (s.len.x - d.len) * k(p.tauSlow);
+        d.len += (s.len.x - d.len) * k(p.tauLen);
         d.n = nlerp3(d.n, s.n, k(p.tauSlow)); d.up = nlerp3(d.up, s.up, k(p.tauSlow));
       }
-      d.wx = d.x + s.wo[0]; d.wy = d.y + s.wo[1];
-      // 前臂方向（屏幕坐标）：有姿态识别就用 手腕→手肘，否则按手指的反方向估算
-      d.armOk = !!s.arm && now - s.armTs < 600;
-      const t = armTarget(), ka = k(0.08);
-      const ax = d.arm[0] + (t[0] - d.arm[0]) * ka, ay = d.arm[1] + (t[1] - d.arm[1]) * ka, al = Math.hypot(ax, ay) || 1;
-      d.arm = [ax / al, ay / al];
-      d.armLen += ((d.armOk ? s.arm.len : d.len * 2.2) - d.armLen) * ka;
+      d.wx = d.x + Math.cos(d.roll + s.woA) * s.woR * d.len;
+      d.wy = d.y + Math.sin(d.roll + s.woA) * s.woR * d.len;
+      // 姿态识别一段时间没来，弯曲角、长度和倾斜慢慢退回默认值
+      const conf = Math.exp(-Math.max(0, now - s.poseTs) / p.poseHold), ka = k(0.08);
+      d.bend += angDiff(s.bend * conf, d.bend) * ka;
+      const ang = d.roll + Math.PI + d.bend;
+      d.arm = [Math.cos(ang), Math.sin(ang)];
+      const ratio = p.armRatio * Math.cos(p.armTilt) + (s.ratio2D - p.armRatio * Math.cos(p.armTilt)) * conf;
+      d.armLen = d.armLen ? d.armLen + (d.len * ratio - d.armLen) * ka : d.len * ratio;
+      d.armTilt += (p.armTilt + (s.tilt - p.armTilt) * conf - d.armTilt) * ka;
+      d.armOk = conf > 0.5;
     }
     return this.slots;
   }
@@ -231,22 +258,21 @@ export class TimeDial {
   }
 }
 
-export const INTERACT_DEFAULTS = { tauT: 0.06, lockIn: 0.25, lockOut: 0.5, wheelStep: 0.001, backlash: 0.012 };
+export const INTERACT_DEFAULTS = { tauT: 0.06, wheelStep: 0.001, backlash: 0.012 };
 
-// 法阵的出现、锁定和拨时间。rigs：每个法阵 { want（张开=1）, x, y（屏幕像素）, radius, roll, key（手的槽位+跟踪纪元，鼠标为 null） }
+// 法阵的出现和拨时间。rigs：每个法阵 { want（张开=1）, roll, key（手的槽位+跟踪纪元，鼠标为 null） }。
+// 张开手掌、法阵出来就能拨，不用靠近物品；两只手都张开时，先张开的那只说了算
 export class Interaction {
   constructor(lifeRad, params = {}) {
     this.p = { ...INTERACT_DEFAULTS, ...params };
     this.dial = new TimeDial(lifeRad, this.p.backlash);
     this.t = 0; this.target = 0; this.owner = -1;
   }
-  step(dt, rigs, obj, wheel = 0) {
+  step(dt, rigs, wheel = 0) {
     const p = this.p;
     for (const r of rigs) {
       r.presence = damp(r.presence ?? 0, r.want, r.want ? 5 : 4, dt);
-      const d = Math.hypot(r.x - obj.cx, r.y - obj.cy);
-      // 锁定和脱开用不同的距离（迟滞），法阵在边界上抖动也不会一会儿锁一会儿脱
-      r.locked = r.presence > 0.5 && d < r.radius + obj.size * (r.locked ? p.lockOut : p.lockIn);
+      r.locked = r.presence > 0.5 && r.want === 1;
     }
     const drives = r => r && r.locked && r.want === 1 && r.key != null;
     if (!drives(rigs[this.owner])) this.owner = rigs.findIndex(drives);

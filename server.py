@@ -6,7 +6,7 @@
 API Key 由浏览器随请求带来，服务端不落盘、不打印。
 用法：python server.py [端口]
 """
-import collections, json, os, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import collections, gzip, json, os, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -25,6 +25,9 @@ ALLOWED_HOSTS = tuple(h.strip().lower() for h in os.environ.get('TIMESPELL_ALLOW
 LIMITS = {'/api/chat': 20, '/api/models': 60, '/api/objects': 20}   # 公开模式：每个 IP 每小时的次数，全站上限是它的 20 倍
 MAX_BODY = 2_500_000
 KEEP_DAYS, MAX_USER_FILES = 7, 500
+# 文本文件压缩后再发：创空间的带宽只有几十 KB/s，three.js 1.3MB 压完只剩三百来 KB
+GZIP_SUFFIXES = ('.js', '.mjs', '.html', '.json', '.md', '.css', '.txt')
+_gz_cache = {}
 _hits = collections.defaultdict(collections.deque)
 _lock = threading.Lock()
 _busy = threading.BoundedSemaphore(int(os.environ.get('TIMESPELL_MAX_GENERATIONS', '3')))
@@ -99,7 +102,34 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(200, {'ok': True, 'public': PUBLIC})
         if not is_public_file(rel):
             return self.send_error(404)
+        if self.send_gzip(rel):
+            return
         return super().do_GET()
+
+    def send_gzip(self, rel):
+        if 'gzip' not in self.headers.get('Accept-Encoding', ''):
+            return False
+        f = (ROOT / (rel or 'index.html')).resolve()
+        if f.suffix not in GZIP_SUFFIXES or ROOT not in f.parents or not f.is_file():
+            return False
+        st = f.stat()
+        hit = _gz_cache.get(f)
+        if not hit or hit[0] != (st.st_mtime_ns, st.st_size):
+            hit = _gz_cache[f] = ((st.st_mtime_ns, st.st_size), gzip.compress(f.read_bytes(), 6))
+        modified = self.date_time_string(st.st_mtime)
+        if self.headers.get('If-Modified-Since') == modified:
+            self.send_response(304)
+            self.end_headers()
+            return True
+        self.send_response(200)
+        self.send_header('Content-Type', self.guess_type(str(f)))
+        self.send_header('Content-Encoding', 'gzip')
+        self.send_header('Content-Length', str(len(hit[1])))
+        self.send_header('Last-Modified', modified)
+        self.send_header('Vary', 'Accept-Encoding')
+        self.end_headers()
+        self.wfile.write(hit[1])
+        return True
 
     def do_HEAD(self):
         if not is_public_file(rel_path(self.path)):

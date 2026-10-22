@@ -1,12 +1,12 @@
 // 调参用：在 check_tracker 的同一组合成数据上扫一遍参数，打印关键指标
 import { runNew, metrics, CHECKS } from './check_tracker.mjs';
 const rows = [];
-for (const lead of [0.5, 0.6, 0.7])
-  for (const tauPos of [0.016, 0.024, 0.032])
-    for (const velK of [0.5, 0.3]) {
-      const m = metrics(runNew({ lead, tauPos, velK, pos: [1.0, 0.02, 2.0], roll: [3.0, 0.4, 2.0] }, { backlash: 0.012 }));
-      const fails = CHECKS.filter(([k, , ok]) => !ok(m[k])).map(([k]) => k);
-      rows.push({ lead, tauPos, velK, jit: m.jitter.toFixed(2), lag: m.lagMs.toFixed(0), lagFast: m.lagFastMs.toFixed(0), cv: m.stepCV.toFixed(3), cvFast: m.stepCVFast.toFixed(3),
-        over: m.overshoot.toFixed(1), fails: fails.join(',') || '-' });
+for (const len of [[1.2, 0.02, 1.5], [2.0, 0.03, 1.5], [2.0, 0.06, 2.0], [3.0, 0.05, 2.0]])
+  for (const tauLen of [0.02, 0.03])
+    for (const tauBend of [0.12, 0.25]) {
+      const m = metrics(runNew({ len, tauLen, tauBend }));
+      const fails = CHECKS.filter(([k, , ok]) => m[k] === null || !ok(m[k])).map(([k]) => k);
+      rows.push({ len: len.join('/'), tauLen, tauBend, sizeLag: m.sizeLagMs.toFixed(0), sizeErr: m.sizeErr.toFixed(2), jit: m.jitter.toFixed(2),
+        armRot: m.armErrRot.toFixed(2), armHold: m.armErrHold.toFixed(2), wrist: m.wristErr.toFixed(1), fails: fails.join(',') || '-' });
     }
 console.table(rows);

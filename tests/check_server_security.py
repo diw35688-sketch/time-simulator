@@ -51,6 +51,22 @@ def check(name, cond):
     checks[name] = 'OK' if cond else 'FAIL'
 
 
+def gzip_checks():
+    import gzip as gz
+    raw = (ROOT / 'vendor' / 'three' / 'three.module.js').read_bytes()
+    r = urllib.request.urlopen(urllib.request.Request(B + '/vendor/three/three.module.js', headers={'Accept-Encoding': 'gzip'}), timeout=20)
+    body, lm = r.read(), r.headers.get('Last-Modified')
+    check('文本文件 gzip 压缩发送', r.headers.get('Content-Encoding') == 'gzip' and gz.decompress(body) == raw and len(body) < len(raw) / 3)
+    check('压缩后仍允许跨源（物品页要用）', r.headers.get('Access-Control-Allow-Origin') == '*')
+    try:
+        code = urllib.request.urlopen(urllib.request.Request(B + '/vendor/three/three.module.js', headers={'Accept-Encoding': 'gzip', 'If-Modified-Since': lm}), timeout=20).status
+    except urllib.error.HTTPError as e:
+        code = e.code
+    check('没变的文件回 304', code == 304)
+    s, h = get('/vendor/mediapipe/hand_landmarker.task') if (ROOT / 'vendor' / 'mediapipe' / 'hand_landmarker.task').exists() else (200, {})
+    check('二进制文件不压缩', h.get('Content-Encoding') is None if h else True)
+
+
 def http_checks():
     s, h = get('/'); check('首页 200', s == 200)
     check('首页不给跨源许可', h.get('Access-Control-Allow-Origin') is None)
@@ -125,6 +141,7 @@ async def browser_checks():
 
 try:
     http_checks()
+    gzip_checks()
     mode_checks()
     if '--browser' in sys.argv or PUBLIC:
         import asyncio

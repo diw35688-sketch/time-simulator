@@ -159,8 +159,15 @@ $('stTest').onclick = async () => {
 // ---------- 生成 ----------
 let abort = null;
 const THREE_CDN = /https?:\/\/(cdn\.jsdelivr\.net|unpkg\.com|esm\.sh|cdnjs\.cloudflare\.com)\/[^"'\s]*three(@[\d.]+)?\/build\/three\.module(\.min)?\.js/g;
+// 模型经常只把画布设成透明、忘了 html/body 的背景，嵌入后整页黑底会盖住摄像头画面：统一补一段强制透明的样式
+const EMBED_FIX = '<style>html.ts-embed, html.ts-embed body { background: transparent !important; }</style>' + String.fromCharCode(10) +
+  "<script>if (new URLSearchParams(location.search).get('embed') === '1') document.documentElement.classList.add('ts-embed');</script>";
 function checkHtml(html) {
   const fixes = [], warns = [];
+  if (!html.includes('ts-embed')) {
+    const m = html.match(/<head[^>]*>/i) || html.match(/<html[^>]*>/i), at = m ? m.index + m[0].length : 0;
+    html = html.slice(0, at) + String.fromCharCode(10) + EMBED_FIX + String.fromCharCode(10) + html.slice(at);
+  }
   if (html.match(THREE_CDN)) { html = html.replace(THREE_CDN, '/vendor/three/three.module.js'); fixes.push('three.js CDN 地址已改成本地'); }
   if (!html.includes('/vendor/three/three.module.js')) warns.push('没有按要求从 /vendor/three/three.module.js 引入 three.js');
   if (!/setTime\s*=|function\s+setTime/.test(html)) warns.push('没有找到 setTime');
@@ -293,4 +300,4 @@ if (urlObject) {
   if (hit) { $('stObj').value = hit.id; $('stObjNote').textContent = hit.prompt ? '描述：' + hit.prompt : hit.src; }
 } else applyObject();
 // 自动化测试入口
-window.__studioTest = { syntaxError, async repairOnce(html) { abort = new AbortController(); try { return await repair(html, syntaxError(html), () => {}); } finally { abort = null; } } };
+window.__studioTest = { syntaxError, checkHtml, async repairOnce(html) { abort = new AbortController(); try { return await repair(html, syntaxError(html), () => {}); } finally { abort = null; } } };

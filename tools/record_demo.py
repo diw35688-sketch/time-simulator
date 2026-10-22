@@ -61,7 +61,7 @@ async def demo_gif(b, out):
 
     for _ in range(4):
         await snap()                                   # 还没召唤法阵
-    await pg.mouse.move(840, 420, steps=6)             # 法阵出现在苹果右边，距离够近会锁定
+    await pg.mouse.move(880, 320, steps=6)             # 法阵在苹果右上方，不碰到苹果也能隔空拨时间
     for _ in range(10):
         await snap()
     for delta, steps, hold in [(50, 20, 6), (-50, 40, 6), (50, 20, 8)]:   # 拨到未来 → 拨回过去 → 回到现在
@@ -97,23 +97,27 @@ async def gallery(b, out, items):
             shots.append((im, min(stages, key=lambda s: abs(s['t'] - t))['name'] if stages else ''))
         await ctx.close()
         rows.append(shots)
-    tile, label_h, head_h = 320, 50, 60
-    sheet = Image.new('RGB', (tile * 3, head_h + len(rows) * (tile + label_h)), BG)
+    # 每行放两个物品，每个物品三格：过去、现在、未来
+    tile, label_h, head_h, gap, per_row = 200, 40, 50, 24, 2
+    rows_n = (len(rows) + per_row - 1) // per_row
+    width = per_row * 3 * tile + (per_row - 1) * gap
+    sheet = Image.new('RGB', (width, head_h + rows_n * (tile + label_h)), BG)
     d = ImageDraw.Draw(sheet)
-    for i, lab in enumerate(['过去  t = -1', '现在  t = 0', '未来  t = +1']):
-        d.text((i * tile + tile // 2, head_h // 2), lab, font=font(26), fill=(150, 255, 190), anchor='mm')
+    for g in range(per_row):
+        for i, lab in enumerate(['过去', '现在', '未来']):
+            d.text((g * (3 * tile + gap) + i * tile + tile // 2, head_h // 2), lab, font=font(22), fill=(150, 255, 190), anchor='mm')
     for r, shots in enumerate(rows):
         alpha = np.stack([np.asarray(im)[..., 3] for im, _ in shots]).max(0)
         ys, xs = np.where(alpha > 10)
         side = int(max(xs.max() - xs.min(), ys.max() - ys.min()) * 1.12)
         cx, cy = (xs.min() + xs.max()) // 2, (ys.min() + ys.max()) // 2
         box = (cx - side // 2, cy - side // 2, cx - side // 2 + side, cy - side // 2 + side)
-        y = head_h + r * (tile + label_h)
+        x0, y = (r % per_row) * (3 * tile + gap), head_h + (r // per_row) * (tile + label_h)
         for c, (im, name) in enumerate(shots):
             cell = Image.new('RGBA', (side, side), BG + (255,))
             cell.alpha_composite(im.crop(box))
-            sheet.paste(cell.convert('RGB').resize((tile, tile), Image.LANCZOS), (c * tile, y))
-            d.text((c * tile + tile // 2, y + tile + label_h // 2), name, font=font(22), fill=(215, 255, 225), anchor='mm')
+            sheet.paste(cell.convert('RGB').resize((tile, tile), Image.LANCZOS), (x0 + c * tile, y))
+            d.text((x0 + c * tile + tile // 2, y + tile + label_h // 2), name.split(' · ')[0][:9], font=font(17), fill=(215, 255, 225), anchor='mm')
     sheet.save(out, quality=90)
 
 
@@ -121,7 +125,7 @@ async def main():
     async with async_playwright() as p:
         b = await p.chromium.launch(args=['--use-gl=angle', '--enable-unsafe-swiftshader'])
         frames = await demo_gif(b, ROOT / 'docs' / 'demo.gif')
-        await gallery(b, ROOT / 'docs' / 'objects.jpg', ['objects/apple3d.html', 'objects/candle.html'])
+        await gallery(b, ROOT / 'docs' / 'objects.jpg', [f'objects/{n}.html' for n in ('apple3d', 'candle', 'rose', 'ice', 'tree', 'snowman', 'coffee')])
         await b.close()
     for f in ['demo.gif', 'objects.jpg']:
         print(f, round((ROOT / 'docs' / f).stat().st_size / 1e6, 2), 'MB')

@@ -41,7 +41,8 @@ async def run(b, query):
     await pg.wait_for_timeout(600)
     await pg.mouse.wheel(0, 300)
     await pg.wait_for_timeout(400)
-    out['far_t'] = (await st())['t']
+    out['far_target'] = round((await st())['tTarget'], 3)   # 不用靠近物品：离得远滚三格也该走到 0.3
+    await pg.evaluate('window.__setTime(0)')
     await pg.mouse.move(640, 432, steps=10)
     await pg.wait_for_timeout(800)
     await pg.mouse.click(640, 432)

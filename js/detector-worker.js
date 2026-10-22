@@ -5,32 +5,35 @@ let hands = null, pose = null;
 
 self.onmessage = e => {
   const m = e.data;
-  if (m.type === 'init') init(m.candidates, m.delegate);
+  if (m.type === 'init') init(m);
   else if (m.type === 'frame') detect(m);
 };
 
-async function init(candidates, only) {
+// m：{ kind: 'hand' | 'pose', delegate, js: [{ bundle, loader, wasm }...], wasm: ArrayBuffer | null, model: ArrayBuffer | null, modelUrl }
+async function init(m) {
+  // wasm 和模型通常是主线程下载好传进来的；没有的话按地址加载
+  const wasmUrl = m.wasm ? URL.createObjectURL(new Blob([m.wasm], { type: 'application/wasm' })) : null;
+  const asset = m.model ? { modelAssetBuffer: new Uint8Array(m.model) } : { modelAssetPath: m.modelUrl };
+  const isHand = m.kind === 'hand';
+  const opts = isHand ? { numHands: 2, minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5 } : { numPoses: 1 };
   let lastErr = null;
-  for (const c of candidates) {
+  for (const js of m.js) {
     try {
-      const mp = await import(c.base + 'vision_bundle.mjs');
-      const fs = await mp.FilesetResolver.forVisionTasks(c.base + 'wasm');
-      const make = (Task, model, delegate, extra) => Task.createFromOptions(fs, { baseOptions: { modelAssetPath: model, delegate }, runningMode: 'VIDEO', ...extra });
-      const handOpts = { numHands: 2, minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5 };
-      let delegate = only || 'GPU';
-      const create = async (Task, model, opts) => {
-        try { return await make(Task, model, delegate, opts); }
-        catch (err) { if (only || delegate === 'CPU') throw err; delegate = 'CPU'; return make(Task, model, 'CPU', opts); }
-      };
-      if (c.hand) hands = await create(mp.HandLandmarker, c.hand, handOpts);
-      if (c.pose) pose = await create(mp.PoseLandmarker, c.pose, { numPoses: 1 });
+      const mp = await import(js.bundle);
+      const fileset = { wasmLoaderPath: js.loader, wasmBinaryPath: wasmUrl || js.wasm };
+      const Task = isHand ? mp.HandLandmarker : mp.PoseLandmarker;
+      const make = delegate => Task.createFromOptions(fileset, { baseOptions: { ...asset, delegate }, runningMode: 'VIDEO', ...opts });
+      let delegate = m.delegate || 'GPU', task;
+      try { task = await make(delegate); }
+      catch (err) { if (m.delegate) throw err; delegate = 'CPU'; task = await make('CPU'); }
+      if (isHand) hands = task; else pose = task;
       // 预热：第一次推理要编译着色器（GPU 上可能要好几秒），在报“就绪”之前做完，免得手第一次出现时卡住
       const blank = new OffscreenCanvas(640, 360);
       blank.getContext('2d').fillRect(0, 0, 640, 360);
-      for (const task of [hands, pose]) if (task) { const bmp = await createImageBitmap(blank); task.detectForVideo(bmp, 1); bmp.close(); }
-      const main = hands || pose, bmp = await createImageBitmap(blank);
-      const t0 = performance.now(); main.detectForVideo(bmp, 2); const bench = performance.now() - t0; bmp.close();
-      self.postMessage({ type: 'ready', delegate, hands: !!hands, pose: !!pose, local: !!c.local, bench });
+      let bmp = await createImageBitmap(blank); task.detectForVideo(bmp, 1); bmp.close();
+      bmp = await createImageBitmap(blank);
+      const t0 = performance.now(); task.detectForVideo(bmp, 2); const bench = performance.now() - t0; bmp.close();
+      self.postMessage({ type: 'ready', delegate, kind: m.kind, bench });
       return;
     } catch (err) { lastErr = err; }
   }
@@ -44,7 +47,7 @@ function detect({ bitmap, ts }) {
       const r = hands.detectForVideo(bitmap, ts), hd = r.handedness || r.handednesses || [];
       out.hands = (r.landmarks || []).map((lm, i) => ({
         lm: lm.map(p => ({ x: p.x, y: p.y, z: p.z })),
-        handed: hd[i] && hd[i][0] ? hd[i][0].categoryName : '', score: hd[i] && hd[i][0] ? hd[i][0].score : 1,
+        handed: hd[i] && hd[i][0] ? hd[i][0].categoryName : String(), score: hd[i] && hd[i][0] ? hd[i][0].score : 1,
       }));
     }
     if (pose) {

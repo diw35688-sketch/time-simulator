@@ -178,7 +178,26 @@ function trackMaterial() {
   });
 }
 const PLANE = new THREE.PlaneGeometry(2, 2), TRACK_GEO = new THREE.RingGeometry(TRACK_R[0] - .01, TRACK_R[1] + .01, 256, 1);
-const BAND_GEO = new THREE.CylinderGeometry(1, 1, .16, 96, 1, true);
+const BAND_GEO = new THREE.CylinderGeometry(1, 1, .16, 128, 1, true);
+// 前臂环：朝镜头的前半圈正常亮；背面那半圈（隔着手臂看到的）中间被手臂挡住、压暗，只留两侧露出来的部分，看起来就像套在手臂上
+function bandMaterial(tex) {
+  return new THREE.ShaderMaterial({
+    uniforms: { uMap: { value: tex }, uOpacity: { value: 0 }, uLat: { value: new THREE.Vector3(1, 0, 0) } },
+    vertexShader: `uniform vec3 uLat; varying vec2 vUv; varying float vLat;
+      void main() {
+        vUv = uv; vLat = dot(normalize(vec3(position.x, 0.0, position.z)), uLat);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `uniform sampler2D uMap; uniform float uOpacity; varying vec2 vUv; varying float vLat;
+      void main() {
+        vec4 c = texture2D(uMap, vUv);
+        float vis = gl_FrontFacing ? 1.0 : mix(0.05, 0.5, smoothstep(0.55, 0.95, abs(vLat)));
+        gl_FragColor = vec4(c.rgb, c.a * uOpacity * vis);
+        #include <colorspace_fragment>
+      }`,
+    transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+  });
+}
 
 function makeRig() {
   const root = new THREE.Group(), disc = new THREE.Group();
@@ -188,8 +207,9 @@ function makeRig() {
   const knob = new THREE.Mesh(PLANE, additive(KNOB_TEX));
   disc.add(fill, ...layers, track, knob);
   root.add(disc);
-  const rings = [[.25, .5, 0], [.55, .55, 1], [.85, .6, 2]].map(([along, rad, ti], i) => {
-    const m = new THREE.Mesh(BAND_GEO, additive(BAND_TEX[ti]));
+  // 三个环：位置是手腕到手肘的比例，半径是手掌长的倍数（前臂越靠手肘越粗）
+  const rings = [[.1, .46], [.33, .54], [.56, .6]].map(([along, rad], i) => {
+    const m = new THREE.Mesh(BAND_GEO, bandMaterial(BAND_TEX[i]));
     m.userData = { along, rad, idle: i % 2 ? -.8 : .6, gear: [2.2, -2.6, 3][i] };
     root.add(m); return m;
   });
@@ -197,11 +217,11 @@ function makeRig() {
   scene.add(root);
   return { root, disc, fill, layers, track, knob, rings, quat: new THREE.Quaternion(), lock: 0, flash: 0, summoned: false,
     want: 0, presence: 0, locked: false, x: innerWidth / 2, y: innerHeight / 2, radius: 120, roll: 0, key: null,
-    hand: false, handLen: 80, n: [0, 0, 1], arm: [0, 1], armLen: 180, armOk: false, wx: 0, wy: 0 };
+    hand: false, handLen: 80, n: [0, 0, 1], arm: [0, 1], armLen: 180, armTilt: .6, armOk: false, wx: 0, wy: 0 };
 }
 const rigs = [makeRig(), makeRig()];
 
-// 锁定标记：法阵锁定物品时，物品外围亮起一圈反向转动的符文
+// 控制标记：法阵控制着时间时，物品外围亮起一圈反向转动的符文
 const objRing = new THREE.Group();
 const objRingA = new THREE.Mesh(PLANE, additive(DISC_LAYERS[0].tex)), objRingB = new THREE.Mesh(PLANE, additive(DISC_LAYERS[2].tex));
 objRing.add(objRingA, objRingB); objRing.visible = false; scene.add(objRing);
@@ -211,6 +231,7 @@ let lockGlow = 0;
 const MAXP = 900;
 const pGeo = new THREE.BufferGeometry();
 const pPos = new Float32Array(MAXP * 3), pAlpha = new Float32Array(MAXP), pVel = new Float32Array(MAXP * 3), pLife = new Float32Array(MAXP);
+const pDrag = new Float32Array(MAXP).fill(1);   // 1：火花，会慢慢减速；0：流向物品的光点，匀速飞行
 pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
 pGeo.setAttribute('alpha', new THREE.BufferAttribute(pAlpha, 1));
 const pMat = new THREE.ShaderMaterial({
@@ -234,7 +255,20 @@ function spawn(r, n, speed, cw) {
     const tx = _ax.x * sa - _ay.x * ca, ty = _ax.y * sa - _ay.y * ca, tz = _ax.z * sa - _ay.z * ca;
     pPos[i * 3] = c.x + ox * rr; pPos[i * 3 + 1] = c.y + oy * rr; pPos[i * 3 + 2] = c.z + oz * rr;
     pVel[i * 3] = tx * sp * cw + ox * 25; pVel[i * 3 + 1] = ty * sp * cw + oy * 25; pVel[i * 3 + 2] = tz * sp * cw + oz * 25;
-    pLife[i] = .4 + Math.random() * .8;
+    pLife[i] = .4 + Math.random() * .8; pDrag[i] = 1;
+  }
+}
+// 流向物品的光点：从法阵里随机一点出发，匀速飞向物品中心，到达时正好消失
+function spawnStream(r, target, n) {
+  _ax.set(1, 0, 0).applyQuaternion(r.quat); _ay.set(0, 1, 0).applyQuaternion(r.quat);
+  const c = r.disc.position;
+  for (let k = 0; k < n; k++) {
+    const i = pNext = (pNext + 1) % MAXP, a = Math.random() * Math.PI * 2, rr = r.radius * (.2 + Math.random() * .7);
+    const ox = c.x + (_ax.x * Math.cos(a) + _ay.x * Math.sin(a)) * rr, oy = c.y + (_ax.y * Math.cos(a) + _ay.y * Math.sin(a)) * rr, oz = c.z + (_ax.z * Math.cos(a) + _ay.z * Math.sin(a)) * rr;
+    const dx = target.x - ox, dy = target.y - oy, dz = target.z - oz, dist = Math.hypot(dx, dy, dz) || 1, sp = 450 + Math.random() * 350;
+    pPos[i * 3] = ox; pPos[i * 3 + 1] = oy; pPos[i * 3 + 2] = oz;
+    pVel[i * 3] = dx / dist * sp; pVel[i * 3 + 1] = dy / dist * sp; pVel[i * 3 + 2] = dz / dist * sp;
+    pLife[i] = Math.min(dist / sp, 1.6); pDrag[i] = 0;
   }
 }
 function stepParticles(dt) {
@@ -242,7 +276,8 @@ function stepParticles(dt) {
   for (let i = 0; i < MAXP; i++) {
     if (pLife[i] <= 0) { pAlpha[i] = 0; continue; }
     pLife[i] -= dt;
-    for (let j = 0; j < 3; j++) { pPos[i * 3 + j] += pVel[i * 3 + j] * dt; pVel[i * 3 + j] *= damp; }
+    const k = pDrag[i] ? damp : 1;
+    for (let j = 0; j < 3; j++) { pPos[i * 3 + j] += pVel[i * 3 + j] * dt; pVel[i * 3 + j] *= k; }
     pAlpha[i] = Math.max(pLife[i], 0) * 1.3;
   }
   pGeo.attributes.position.needsUpdate = pGeo.attributes.alpha.needsUpdate = true;
@@ -305,15 +340,56 @@ const det = { mode: '', delegate: '', ready: false, busy: false, worker: null, h
   sent: 0, got: 0, dropped: 0, t0: 0, readyMs: 0, gpuMs: 0, poseMs: 0 };
 // 手臂（姿态）识别单独一个 GPU 线程：每 3 帧、看到手时才识别，只用来摆前臂环，不拖慢手的识别
 const poseDet = { ready: false, busy: false, worker: null, n: 0, sentAt: 0 };
-const LOCAL_MP = new URL('../vendor/mediapipe/', import.meta.url).href, CDN_MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/';
-const HAND_MODELS = [
-  { base: LOCAL_MP, hand: LOCAL_MP + 'hand_landmarker.task', local: true },
-  { base: CDN_MP, hand: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', local: false },
-];
-const POSE_MODELS = [{ base: LOCAL_MP, pose: LOCAL_MP + 'pose_landmarker_lite.task', local: true }];
+// MediaPipe 的 JS（共几百 KB）依次试：本站、npmmirror、jsdelivr
+const LOCAL_MP = new URL('../vendor/mediapipe/', import.meta.url).href;
+const MP_JS = [LOCAL_MP, 'https://registry.npmmirror.com/@mediapipe/tasks-vision/0.10.14/files/', 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/']
+  .map(b => ({ bundle: b + 'vision_bundle.mjs', loader: b + 'wasm/vision_wasm_internal.js', wasm: b + 'wasm/vision_wasm_internal.wasm' }));
+// 大文件（wasm 9MB、手 8MB、手臂 6MB）：先查浏览器缓存；本机运行先用 vendor/ 里的，线上先从魔搭模型库的 CDN 下
+// （创空间自己的带宽只有几十 KB/s，CDN 有几 MB/s）。下好存进缓存，下次打开不用再下
+const ASSET_CDN = 'https://www.modelscope.cn/models/c8iolab/time-simulator-assets/resolve/master/';
+const ASSETS = { wasm: 'wasm/vision_wasm_internal.wasm', hand: 'hand_landmarker.task', pose: 'pose_landmarker_lite.task' };
+const GOOGLE_MODELS = {
+  hand: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+  pose: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+};
+const IS_LOCAL = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+const dl = { got: 0, total: 0, active: 0 }, assetJobs = {};
+function loadAsset(name) {
+  return assetJobs[name] ||= (async () => {
+    const file = ASSETS[name], base = file.split('/').pop(), key = new URL('timespell-asset/' + base, location.href).href;
+    let cache = null;
+    try { cache = await caches.open('timespell-assets-v1'); const hit = await cache.match(key); if (hit) return await hit.arrayBuffer(); } catch {}
+    for (const u of IS_LOCAL ? [LOCAL_MP + file, ASSET_CDN + base] : [ASSET_CDN + base, LOCAL_MP + file]) {
+      try {
+        const buf = await download(u);
+        if (cache) cache.put(key, new Response(buf.slice(0))).catch(() => {});
+        return buf;
+      } catch (err) { console.warn(`${base} 从 ${u} 下载失败：`, err.message); }
+    }
+    throw new Error(base + ' 下载失败');
+  })();
+}
+// 边下边记进度，显示在右上角的状态里
+async function download(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const parts = [];
+  let got = 0;
+  dl.total += +r.headers.get('Content-Length') || 0; dl.active++;
+  try {
+    const reader = r.body.getReader();
+    for (;;) { const { value, done } = await reader.read(); if (done) break; parts.push(value); got += value.length; dl.got += value.length; }
+  } finally { if (!--dl.active) dl.got = dl.total = 0; }
+  const out = new Uint8Array(got);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out.buffer;
+}
 
-// 起一个识别线程，预热完成后给出 { w, delegate, bench }（bench：预热后单帧耗时 ms）
-function spawnWorker(candidates, delegate) {
+// 起一个识别线程（kind：hand 或 pose），预热完成后给出 { w, delegate, bench }（bench：预热后单帧耗时 ms）。
+// wasm 和模型由主线程下载好传过去，几个线程共用一份下载
+async function spawnWorker(kind, delegate) {
+  const [wasm, model] = await Promise.all([loadAsset('wasm').catch(() => null), loadAsset(kind).catch(() => null)]);
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('./detector-worker.js', import.meta.url));
     const fail = err => { w.terminate(); reject(err); };
@@ -323,7 +399,7 @@ function spawnWorker(candidates, delegate) {
       if (m.type === 'error') fail(new Error(m.message));
       else if (m.type === 'ready') resolve({ w, delegate: m.delegate, bench: m.bench });
     };
-    w.postMessage({ type: 'init', candidates, delegate });
+    w.postMessage({ type: 'init', kind, delegate, js: MP_JS, wasm, model, modelUrl: GOOGLE_MODELS[kind] });
   });
 }
 function withTimeout(promise, ms, msg) {
@@ -337,7 +413,7 @@ function updateStatus() {
 }
 function useWorker(info) {
   const old = det.worker;
-  Object.assign(det, { mode: 'worker', worker: info.w, delegate: info.delegate, bench: info.bench, ready: true, busy: false });
+  Object.assign(det, { mode: 'worker', worker: info.w, delegate: info.delegate, bench: info.bench, cost: info.bench, ready: true, busy: false });
   info.w.onerror = e => console.error('识别线程出错', e.message);
   info.w.onmessage = ev => {
     if (ev.data.type !== 'result' || ev.target !== det.worker) return;
@@ -348,48 +424,56 @@ function useWorker(info) {
   if (old && old !== info.w) old.terminate();
   updateStatus();
 }
-// 先起 CPU 线程，马上能用；再起 GPU 线程预热（编译着色器，第一次可能要十几秒，浏览器缓存后会快很多），
-// 好了而且比 CPU 实际跑起来快就换过去，40 秒还没好就放弃。手的 GPU 线程就绪后再起手臂识别线程
+// 先起 CPU 线程，一两秒就能用；同时在后台给 GPU 上的手和手臂两个线程预热（编译着色器，第一次可能要十几秒，
+// 浏览器缓存后快很多）。两个都好了再一起切过去：预热时很占 GPU，不能让它拖慢正在用的识别
 async function startWorkers(only) {
   const first = only || 'CPU';
   det.t0 = performance.now();
-  try { useWorker(await spawnWorker(HAND_MODELS, first)); det.readyMs = performance.now() - det.t0; }
+  try { useWorker(await spawnWorker('hand', first)); det.readyMs = performance.now() - det.t0; }
   catch (err) { if (only) throw err; console.warn('CPU 识别线程不可用：', err.message); }
   if (only === 'CPU') return;
   if (det.delegate === 'GPU') { startPose(); return; }
-  const upgrade = withTimeout(spawnWorker(HAND_MODELS, 'GPU'), 40000, 'GPU 预热超过 40 秒').then(info => {
+  const gpu = withTimeout(spawnWorker('hand', 'GPU'), 40000, 'GPU 预热超过 40 秒');
+  const arms = withTimeout(spawnWorker('pose', 'GPU'), 40000, '手臂识别预热超过 40 秒');
+  const upgrade = gpu.then(async info => {
+    const armInfo = await arms.catch(err => { console.warn('手臂识别不可用，前臂按手的方向估算：', err.message); return null; });
     const cpuCost = det.cost > 0 ? det.cost : det.bench;
-    if (!det.ready || info.bench < cpuCost * 0.8) { useWorker(info); det.gpuMs = performance.now() - det.t0; startPose(); }
+    if (!det.ready || info.bench < cpuCost * 0.8) { useWorker(info); det.gpuMs = performance.now() - det.t0; }
     else { console.info(`GPU 单帧 ${info.bench.toFixed(0)}ms，不比 CPU 的 ${cpuCost.toFixed(0)}ms 快，继续用 CPU`); info.w.terminate(); }
-  }, err => console.warn('GPU 识别线程不用了：', err.message));
+    if (armInfo) usePose(armInfo);
+  }, err => { console.warn('GPU 识别线程不用了：', err.message); arms.then(usePose, () => {}); });
   if (!det.ready) await upgrade;
   if (!det.ready) throw new Error('识别线程都没能启动');
 }
+function usePose(info) {
+  Object.assign(poseDet, { worker: info.w, ready: true });
+  det.poseMs = performance.now() - det.t0;
+  info.w.onmessage = ev => {
+    if (ev.data.type !== 'result') return;
+    poseDet.busy = false;
+    if (ev.data.pose && !ev.data.error) handlePose(ev.data.pose, ev.data.ts);
+  };
+  updateStatus();
+}
 async function startPose() {
   if (poseDet.worker) return;
-  try {
-    const info = await withTimeout(spawnWorker(POSE_MODELS, 'GPU'), 40000, '手臂识别预热超过 40 秒');
-    Object.assign(poseDet, { worker: info.w, ready: true });
-    det.poseMs = performance.now() - det.t0;
-    info.w.onmessage = ev => {
-      if (ev.data.type !== 'result') return;
-      poseDet.busy = false;
-      if (ev.data.pose && !ev.data.error) handlePose(ev.data.pose, ev.data.ts);
-    };
-    updateStatus();
-  } catch (err) { console.warn('手臂识别不可用，前臂环按手的方向估算：', err.message); }
+  try { usePose(await withTimeout(spawnWorker('pose', 'GPU'), 40000, '手臂识别预热超过 40 秒')); }
+  catch (err) { console.warn('手臂识别不可用，前臂按手的方向估算：', err.message); }
 }
 async function startMainThread() {
+  const [wasm, hand, pose] = await Promise.all(['wasm', 'hand', 'pose'].map(n => loadAsset(n).catch(() => null)));
   let lastErr;
-  for (const c of HAND_MODELS) {
+  for (const js of MP_JS) {
     try {
-      const mp = await import(c.base + 'vision_bundle.mjs');
-      const fs = await mp.FilesetResolver.forVisionTasks(c.base + 'wasm');
-      const make = (Task, model, delegate, extra) => Task.createFromOptions(fs, { baseOptions: { modelAssetPath: model, delegate }, runningMode: 'VIDEO', ...extra });
+      const mp = await import(js.bundle);
+      const fileset = { wasmLoaderPath: js.loader, wasmBinaryPath: wasm ? URL.createObjectURL(new Blob([wasm], { type: 'application/wasm' })) : js.wasm };
+      const make = (Task, buf, url, delegate, extra) => Task.createFromOptions(fileset,
+        { baseOptions: { ...(buf ? { modelAssetBuffer: new Uint8Array(buf) } : { modelAssetPath: url }), delegate }, runningMode: 'VIDEO', ...extra });
       const opts = { numHands: 2, minHandDetectionConfidence: .5, minHandPresenceConfidence: .5, minTrackingConfidence: .5 };
       det.delegate = 'GPU';
-      try { det.hand = await make(mp.HandLandmarker, c.hand, 'GPU', opts); } catch { det.delegate = 'CPU'; det.hand = await make(mp.HandLandmarker, c.hand, 'CPU', opts); }
-      if (c.local) try { det.poser = await make(mp.PoseLandmarker, POSE_MODELS[0].pose, det.delegate, { numPoses: 1 }); } catch { det.poser = null; }
+      try { det.hand = await make(mp.HandLandmarker, hand, GOOGLE_MODELS.hand, 'GPU', opts); }
+      catch { det.delegate = 'CPU'; det.hand = await make(mp.HandLandmarker, hand, GOOGLE_MODELS.hand, 'CPU', opts); }
+      if (pose) try { det.poser = await make(mp.PoseLandmarker, pose, null, det.delegate, { numPoses: 1 }); } catch { det.poser = null; }
       Object.assign(det, { mode: 'main', ready: true });
       updateStatus();
       return;
@@ -521,7 +605,7 @@ function initAudio() {
   // AudioContext 必须在点击/按键的同步阶段创建，否则浏览器不让出声
   const ctx = audio.ctx = new AudioContext();
   const master = audio.master = ctx.createGain(); master.gain.value = .9; master.connect(ctx.destination);
-  // 背景乐过低通：法阵出现时变亮，锁定物体时完全打开
+  // 背景乐过低通：法阵出现时变亮，控制时间时完全打开
   audio.bgmLP = ctx.createBiquadFilter(); audio.bgmLP.type = 'lowpass'; audio.bgmLP.frequency.value = 900;
   const bg = ctx.createGain(); bg.gain.value = .4;
   audio.bgmLP.connect(bg).connect(master);
@@ -606,7 +690,7 @@ const MOUSE_N = [0, Math.sin(.45), Math.cos(.45)], MOUSE_ARM = [.33, .94];
 // ---------- 画法阵 ----------
 const Z = new THREE.Vector3(0, 0, 1), Y = new THREE.Vector3(0, 1, 0);
 const _n = new THREE.Vector3(), _x = new THREE.Vector3(), _y = new THREE.Vector3(), _arm = new THREE.Vector3();
-const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _tilt = new THREE.Quaternion(), _spinQ = new THREE.Quaternion();
+const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _tilt = new THREE.Quaternion(), _spinQ = new THREE.Quaternion(), _inv = new THREE.Quaternion(), _view = new THREE.Vector3();
 // 法阵跟着掌面倾斜（缩小到 80%，最多约 55°），但平面里的“正上方”固定朝屏幕上方：刻度的零点（现在）始终在顶上
 function orient(r, dt, snap) {
   _n.set(r.n[0], r.n[1], r.n[2]);
@@ -646,19 +730,24 @@ function drawRigs(now, dt, res, obj) {
     r.knob.position.set(Math.sin(dial) * 1.0525, Math.cos(dial) * 1.0525, .001);
     r.knob.scale.setScalar(.075 * (1 + r.flash * .8 + r.lock * .25));
     r.knob.material.opacity = bright;
-    // 前臂环：屏幕坐标的前臂方向转成世界坐标（y 取反），再往镜头外偏一点，圆柱就呈椭圆环套在手臂上
-    _arm.set(r.arm[0], -r.arm[1], -.55).normalize();
+    // 前臂环：在屏幕上从手腕沿前臂排开（不加深度，免得透视把环挤到手臂外面），
+    // 环的轴线按前臂朝镜头里倾斜的角度转过去，环就呈椭圆套在手臂上；越靠手肘的环越粗
+    const ax = r.arm[0], ay = r.arm[1], ct = Math.cos(r.armTilt), stl = Math.sin(r.armTilt);
+    _arm.set(ax * ct, -ay * ct, -stl);
     _q.setFromUnitVectors(Y, _arm);
-    const wrist = toWorld(r.wx, r.wy);
     r.rings.forEach((m, i) => {
-      const U = m.userData, along = r.armOk ? r.armLen * (.18 + .28 * i) : r.handLen * (.3 + U.along * .9);
-      m.position.copy(wrist).addScaledVector(_arm, along);
+      const U = m.userData, along = r.armLen * U.along;
+      m.position.copy(toWorld(r.wx + ax * along, r.wy + ay * along));
       m.quaternion.copy(_q).multiply(_spinQ.setFromAxisAngle(Y, U.idle * el + U.gear * dial));
-      const rad = r.handLen * U.rad * (r.armOk ? 1 - i * .08 : 1);
-      m.scale.set(rad, r.handLen * 1.2, rad);
-      m.material.opacity = bright * clamp(r.presence * 3 - i * .4, 0, 1) * .9;
+      const rad = r.handLen * U.rad;
+      m.scale.set(rad, r.handLen * 1.1, rad);
+      _view.copy(Z).applyQuaternion(_inv.copy(m.quaternion).invert());
+      m.material.uniforms.uLat.value.set(_view.z, 0, -_view.x).normalize();
+      m.material.uniforms.uOpacity.value = bright * clamp(r.presence * 3 - i * .4, 0, 1) * .95;
     });
     if (r.presence > .5) spawn(r, Math.floor((r.locked ? 2.5 : .8) + Math.min(speedVis, 3) * 25 * Math.random()), Math.min(speedVis, 3), cw);
+    // 隔空控制：时间在动时，从法阵往物品飞一串光点
+    if (r.locked && speedVis > .02 && (rigs.indexOf(r) === ia.owner || r.key == null)) spawnStream(r, toWorld(obj.cx, obj.cy), Math.min(6, 1 + Math.floor(speedVis * 8)));
   }
   lockGlow = approach(lockGlow, rigs.some(r => r.locked) ? 1 : 0, dt, .15);
   objRing.visible = lockGlow > .01;
@@ -696,8 +785,8 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 function updateHud(slots, res) {
   const st = stageName(res.t), locked = rigs.some(r => r.locked);
   const detTxt = det.ready ? ` · 识别 ${det.rate.toFixed(0)}Hz ${det.cost.toFixed(0)}ms · 延迟 ${det.latency.toFixed(0)}ms` : '';
-  $('hud').innerHTML = `FPS ${fps.toFixed(0)}${detTxt}<br>t ${res.t >= 0 ? '+' : ''}${res.t.toFixed(2)}${st ? ' ' + esc(st) : ''}${locked ? ' · 锁定' : ''} · 全程 ${LIFE_DEG}°` +
-    `<br>摄像头 ${camOk ? esc(camLabel.slice(0, 18)) || '开' : '关'} · 手势 ${handStatus}` +
+  $('hud').innerHTML = `FPS ${fps.toFixed(0)}${detTxt}<br>t ${res.t >= 0 ? '+' : ''}${res.t.toFixed(2)}${st ? ' ' + esc(st) : ''}${locked ? ' · 控制中' : ''} · 全程 ${LIFE_DEG}°` +
+    `<br>摄像头 ${camOk ? esc(camLabel.slice(0, 18)) || '开' : '关'} · 手势 ${dl.active ? `下载模型 ${(dl.got / 1e6).toFixed(1)}/${(dl.total / 1e6).toFixed(1)} MB` : handStatus}` +
     `<br>手 ${slots.filter(s => s.seen).length} 只` + slots.map((s, k) => (s.seen ? ` · ${k ? '左' : '右'}${s.open ? '张' : '握'}${s.d.armOk ? '·臂' : ''}` : '')).join('');
 }
 
@@ -718,16 +807,18 @@ function frame(now) {
     const s = slots[k], hidden = r.presence < .02;
     if (s.seen) {
       const d = s.d;
-      Object.assign(r, { hand: true, want: s.open ? 1 : 0, x: d.x, y: d.y, roll: d.roll, key: s.epoch, handLen: d.len, n: d.n, arm: d.arm, armLen: d.armLen, armOk: d.armOk, wx: d.wx, wy: d.wy });
-      r.radius = clamp(d.len * 1.55, 60, minSide * .45);
+      Object.assign(r, { hand: true, want: s.open ? 1 : 0, x: d.x, y: d.y, roll: d.roll, key: s.epoch, handLen: d.len, n: d.n,
+        arm: d.arm, armLen: d.armLen, armTilt: d.armTilt, armOk: d.armOk, wx: d.wx, wy: d.wy });
+      // 法阵大小跟着手掌在画面里的大小走：手往镜头前推就变大，往后撤就变小
+      r.radius = clamp(d.len * 1.55, 40, minSide * .9);
     } else if (k === 0 && useMouse) {
       r.x = hidden ? mouse.x : approach(r.x, mouse.x, dt, .03); r.y = hidden ? mouse.y : approach(r.y, mouse.y, dt, .03);
       r.radius = minSide * .2; r.handLen = r.radius / 1.55;
-      Object.assign(r, { hand: false, want: 1, roll: 0, key: null, n: MOUSE_N, arm: MOUSE_ARM, armLen: r.handLen * 2.2, armOk: false,
-        wx: r.x + MOUSE_ARM[0] * r.handLen, wy: r.y + MOUSE_ARM[1] * r.handLen });
+      Object.assign(r, { hand: false, want: 1, roll: 0, key: null, n: MOUSE_N, arm: MOUSE_ARM, armLen: r.handLen * 2.15, armTilt: .6, armOk: false,
+        wx: r.x + MOUSE_ARM[0] * r.handLen * .55, wy: r.y + MOUSE_ARM[1] * r.handLen * .55 });
     } else { r.want = 0; r.key = null; }
   });
-  const res = ia.step(dt, rigs, obj, mouse.wheel);
+  const res = ia.step(dt, rigs, mouse.wheel);
   mouse.wheel = 0;
   pushTime(res.t);
   drawRigs(now, dt, res, obj);

@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<style>html.ts-embed, html.ts-embed body { background: transparent !important; }</style>
+<script>if (new URLSearchParams(location.search).get('embed') === '1') document.documentElement.classList.add('ts-embed');</script>
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Snowman</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#07090f;}
+  canvas{display:block;position:fixed;inset:0;width:100%;height:100%;}
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:18px 24px 26px;display:flex;flex-direction:column;
+      align-items:center;gap:10px;pointer-events:none;z-index:10;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;}
+  #stageName{color:#cfe0ff;font-size:13px;letter-spacing:.28em;opacity:.85;
+      text-shadow:0 0 12px rgba(120,160,255,.5);min-height:16px;}
+  #slider{pointer-events:auto;width:min(520px,72vw);height:3px;-webkit-appearance:none;appearance:none;
+      background:linear-gradient(90deg,#3a5a8a,#9fc0ff);border-radius:3px;outline:none;}
+  #slider::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;
+      background:#e8f1ff;box-shadow:0 0 12px rgba(160,200,255,.9);cursor:pointer;}
+  #slider::-moz-range-thumb{width:15px;height:15px;border:none;border-radius:50%;
+      background:#e8f1ff;box-shadow:0 0 12px rgba(160,200,255,.9);cursor:pointer;}
+  body.embed #ui{display:none !important;}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="stageName">雪人</div>
+  <input id="slider" type="range" min="-1" max="1" step="0.001" value="0">
+</div>
+<script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   0. 基础工具（纯函数 / 固定种子，画面只依赖 t）
+   ============================================================ */
+const clamp01 = x => (x < 0 ? 0 : x > 1 ? 1 : x);
+const sstep = (a, b, x) => { const u = clamp01((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const lerp = (a, b, u) => a + (b - a) * u;
+
+function track(t, pts) {
+  const n = pts.length;
+  if (t <= pts[0][0]) return pts[0][1];
+  for (let i = 0; i < n - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    if (t <= b[0]) {
+      const u = (t - a[0]) / (b[0] - a[0]);
+      const s = u * u * (3 - 2 * u);
+      return a[1] + (b[1] - a[1]) * s;
+    }
+  }
+  return pts[n - 1][1];
+}
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+if (EMBED) document.body.classList.add('embed');
+
+/* ============================================================
+   1. 渲染器 / 场景 / 相机 / 三点布光
+   ============================================================ */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+renderer.setClearColor(EMBED ? 0x000000 : 0x07090f, EMBED ? 0 : 1);
+renderer.domElement.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;display:block;';
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 120);
+
+// 三点布光 + 环境光
+const hemi = new THREE.HemisphereLight(0x9db4e0, 0x161c28, 0.85);
+scene.add(hemi);
+
+const keyLight = new THREE.DirectionalLight(0xfff1da, 2.5);
+keyLight.position.set(3.2, 5.0, 4.0);
+scene.add(keyLight);
+
+const fillLight = new THREE.DirectionalLight(0x7fa8ff, 1.15);
+fillLight.position.set(-4.0, 1.8, 3.2);
+scene.add(fillLight);
+
+const rimLight = new THREE.DirectionalLight(0xc2e4ff, 2.8);
+rimLight.position.set(-2.2, 3.2, -4.5);
+scene.add(rimLight);
+
+const ambLight = new THREE.AmbientLight(0x33415c, 0.9);
+scene.add(ambLight);
+
+// 水面专用高光
+const waterLight = new THREE.PointLight(0xaaccff, 3.0, 7, 2);
+waterLight.position.set(0.9, 2.1, 2.0);
+scene.add(waterLight);
+
+/* ============================================================
+   2. 相机自适应（物品中心 → 屏幕 (50%, 60%)，尺寸受控）
+   ============================================================ */
+const RS = 1.55;                       // 内容包围球半径（世界单位）
+const _P = new THREE.Vector3(0, 1.0, 0);   // 物品中心
+const _Q = new THREE.Vector3();
+const CAM_AZ = 32 * Math.PI / 180;
+const CAM_EL = 13 * Math.PI / 180;
+
+function updateCamera() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const aspect = w / h;
+  camera.aspect = aspect;
+
+  const H = 4 * RS * Math.max(1, h / w);        // 目标可见高度
+  const fovRad = camera.fov * Math.PI / 180;
+  const dist = H / (2 * Math.tan(fovRad / 2));
+
+  // 让 P 落在屏幕 60% 高度处（相机注视点高于 P）
+  const qY = _P.y + 0.10 * H / Math.cos(CAM_EL);
+  _Q.set(0, qY, 0);
+
+  const dx = Math.sin(CAM_AZ) * Math.cos(CAM_EL);
+  const dy = Math.sin(CAM_EL);
+  const dz = Math.cos(CAM_AZ) * Math.cos(CAM_EL);
+
+  camera.position.set(_Q.x + dx * dist, _Q.y + dy * dist, _Q.z + dz * dist);
+  camera.lookAt(_Q);
+  camera.updateProjectionMatrix();
+}
+
+/* ============================================================
+   3. 雪地（始终存在的圆丘，顶点位移随时间变化）
+   ============================================================ */
+const GR = 1.05, GRINGS = 18, GSEGS = 48;
+const GV = (GRINGS + 1) * GSEGS;
+
+const gPos = new Float32Array(GV * 3);
+const gBase = new Float32Array(GV);
+const gIdx = [];
+
+for (let i = 0; i <= GRINGS; i++) {
+  const rf = i / GRINGS;
+  for (let j = 0; j < GSEGS; j++) {
+    const ang = (j / GSEGS) * Math.PI * 2;
+    const x = GR * rf * Math.cos(ang);
+    const z = GR * rf * Math.sin(ang);
+    const idx = i * GSEGS + j;
+    gPos[idx * 3] = x;
+    gPos[idx * 3 + 1] = 0;
+    gPos[idx * 3 + 2] = z;
+
+    const n = 0.5 + 0.5 * (
+      0.55 * Math.sin(x * 5.3 + z * 3.1) +
+      0.30 * Math.sin(x * 11.7 - z * 8.3 + 1.3) +
+      0.15 * Math.cos(z * 7.1 + x * 4.2)
+    );
+    const shape = Math.pow(Math.max(0, 1 - rf * rf), 0.85);
+    gBase[idx] = (0.22 + 0.78 * clamp01(n)) * shape;
+  }
+}
+// 中心扇面
+for (let j = 0; j < GSEGS; j++) {
+  const j2 = (j + 1) % GSEGS;
+  gIdx.push(0, 1 * GSEGS + j2, 1 * GSEGS + j);
+}
+// 环形四边形
+for (let i = 1; i < GRINGS; i++) {
+  for (let j = 0; j < GSEGS; j++) {
+    const j2 = (j + 1) % GSEGS;
+    const a = i * GSEGS + j, b = i * GSEGS + j2;
+    const c = (i + 1) * GSEGS + j, d = (i + 1) * GSEGS + j2;
+    gIdx.push(a, b, c);
+    gIdx.push(b, d, c);
+  }
+}
+
+const groundGeo = new THREE.BufferGeometry();
+groundGeo.setAttribute('position', new THREE.BufferAttribute(gPos, 3));
+groundGeo.setIndex(gIdx);
+groundGeo.computeVertexNormals();
+
+const groundMat = new THREE.MeshStandardMaterial({
+  color: 0xe9f2ff, roughness: 0.92, metalness: 0.0
+});
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.position.y = 0.0;
+scene.add(ground);
+
+/* ---- 水洼 ---- */
+const puddleMat = new THREE.MeshStandardMaterial({
+  color: 0x3c5170, roughness: 0.06, metalness: 0.0,
+  transparent: true, opacity: 0, depthWrite: false
+});
+const puddle = new THREE.Mesh(new THREE.CircleGeometry(1.0, 56), puddleMat);
+puddle.rotation.x = -Math.PI / 2;
+puddle.position.y = 0.022;
+puddle.visible = false;
+scene.add(puddle);
+
+/* ============================================================
+   4. 雪人本体
+   ============================================================ */
+const BODY_R = 0.62;
+const HEAD_R = 0.42;
+
+const snowMat = new THREE.MeshStandardMaterial({
+  color: 0xf2f7ff, roughness: 0.86, metalness: 0.0
+});
+
+const bodyGeo = new THREE.SphereGeometry(1, 40, 26);
+const headGeo = new THREE.SphereGeometry(1, 34, 22);
+
+const body = new THREE.Mesh(bodyGeo, snowMat);
+const head = new THREE.Mesh(headGeo, snowMat);
+body.frustumCulled = false;
+head.frustumCulled = false;
+scene.add(body, head);
+
+/* ---- 炭块材质 ---- */
+const coalMat = new THREE.MeshStandardMaterial({ color: 0x17181d, roughness: 0.62, metalness: 0.12 });
+const coalGeo = new THREE.IcosahedronGeometry(1, 0);
+
+const eyeL = new THREE.Mesh(coalGeo, coalMat);
+const eyeR = new THREE.Mesh(coalGeo, coalMat);
+eyeL.frustumCulled = false; eyeR.frustumCulled = false;
+scene.add(eyeL, eyeR);
+
+const buttons = [];
+for (let i = 0; i < 3; i++) {
+  const b = new THREE.Mesh(coalGeo, coalMat);
+  b.frustumCulled = false;
+  scene.add(b);
+  buttons.push(b);
+}
+
+// 眼睛朝向（头部局部空间，+z 为正面）
+const EYE_DIR_L = new THREE.Vector3(-0.34, 0.26, 0.90).normalize();
+const EYE_DIR_R = new THREE.Vector3(0.34, 0.26, 0.90).normalize();
+
+/* ---- 胡萝卜鼻子 ---- */
+const carrotGeo = new THREE.CylinderGeometry(0.008, 0.062, 0.30, 10, 1);
+carrotGeo.translate(0, 0.15, 0);
+const carrotMat = new THREE.MeshStandardMaterial({ color: 0xe0662a, roughness: 0.68, metalness: 0.02 });
+const nose = new THREE.Mesh(carrotGeo, carrotMat);
+nose.frustumCulled = false;
+scene.add(nose);
+
+const NOSE_ATTACH = new THREE.Vector3(0, 0.10, 1).normalize();
+const NOSE_REST = new THREE.Vector3(0.62, 0.02, 0.78).normalize();
+
+/* ---- 围巾 ---- */
+const scarfMat = new THREE.MeshStandardMaterial({ color: 0xbe3226, roughness: 0.88, metalness: 0.0 });
+const scarfGroup = new THREE.Group();
+const scarfInner = new THREE.Group();
+scarfInner.rotation.x = Math.PI / 2;
+const scarfRing = new THREE.Mesh(new THREE.TorusGeometry(0.30, 0.072, 10, 28), scarfMat);
+scarfInner.add(scarfRing);
+scarfGroup.add(scarfInner);
+
+const tailCurve = new THREE.CatmullRomCurve3([
+  new THREE.Vector3(0.00, 0.00, 0.34),
+  new THREE.Vector3(0.04, -0.10, 0.40),
+  new THREE.Vector3(0.10, -0.22, 0.40),
+  new THREE.Vector3(0.15, -0.33, 0.36)
+]);
+const scarfTail = new THREE.Mesh(new THREE.TubeGeometry(tailCurve, 16, 0.055, 6, false), scarfMat);
+scarfGroup.add(scarfTail);
+scarfGroup.position.set(0, 1.14, 0);
+scene.add(scarfGroup);
+
+/* ---- 树枝手臂 ---- */
+const twigMat = new THREE.MeshStandardMaterial({ color: 0x4a3626, roughness: 0.92, metalness: 0.0 });
+
+function makeArm() {
+  const g = new THREE.Group();
+  const mainGeo = new THREE.CylinderGeometry(0.011, 0.030, 0.52, 6, 1);
+  mainGeo.translate(0, 0.26, 0);
+  const main = new THREE.Mesh(mainGeo, twigMat);
+  g.add(main);
+
+  const subGeo = new THREE.CylinderGeometry(0.007, 0.016, 0.19, 5, 1);
+  subGeo.translate(0, 0.095, 0);
+  const sub = new THREE.Mesh(subGeo, twigMat);
+  sub.position.set(0, 0.30, 0);
+  sub.rotation.z = 0.75;
+  g.add(sub);
+  return g;
+}
+const armL = makeArm();
+const armR = makeArm();
+armL.frustumCulled = false; armR.frustumCulled = false;
+scene.add(armL, armR);
+
+const ARM_DIR_L = new THREE.Vector3(-1.0, 0.42, 0.10).normalize();
+const ARM_DIR_R = new THREE.Vector3(1.0, 0.42, 0.10).normalize();
+
+/* ============================================================
+   5. 雪花粒子（固定数量 + 固定种子，位置由 t 直接算出）
+   ============================================================ */
+function makeFlakeTexture() {
+  const s = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = s;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.32, 'rgba(232,244,255,0.85)');
+  g.addColorStop(1, 'rgba(190,220,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, s, s);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+const FLAKES = 420;
+const FLAKE_BOX_Y = 2.85;
+const flakeRand = mulberry32(90210);
+const flakeData = [];
+const flakePos = new Float32Array(FLAKES * 3);
+for (let i = 0; i < FLAKES; i++) {
+  const x = (flakeRand() * 2 - 1) * 1.30;
+  const z = (flakeRand() * 2 - 1) * 1.30;
+  const y0 = flakeRand() * FLAKE_BOX_Y;
+  const spd = 0.55 + flakeRand() * 0.95;
+  const ph = flakeRand() * Math.PI * 2;
+  flakeData.push({ x, z, y0, spd, ph });
+  flakePos[i * 3] = x;
+  flakePos[i * 3 + 1] = y0;
+  flakePos[i * 3 + 2] = z;
+}
+const flakeGeo = new THREE.BufferGeometry();
+flakeGeo.setAttribute('position', new THREE.BufferAttribute(flakePos, 3));
+
+const flakeMat = new THREE.PointsMaterial({
+  size: 0.075,
+  map: makeFlakeTexture(),
+  transparent: true,
+  depthWrite: false,
+  color: 0xdcebff,
+  opacity: 1,
+  sizeAttenuation: true
+});
+const snowPoints = new THREE.Points(flakeGeo, flakeMat);
+snowPoints.frustumCulled = false;
+scene.add(snowPoints);
+
+/* ============================================================
+   6. 每帧更新（纯 t 函数，不 new 任何资源）
+   ============================================================ */
+const COL_DRY_G = new THREE.Color(0xe9f2ff);
+const COL_WET_G = new THREE.Color(0x8b96a8);
+const COL_DRY_S = new THREE.Color(0xf4f9ff);
+const COL_WET_S = new THREE.Color(0x93a0b6);
+
+const _dq = new THREE.Quaternion();
+const _dv = new THREE.Vector3();
+const _UP = new THREE.Vector3(0, 1, 0);
+const _tmpA = new THREE.Vector3();
+
+const BTN_LOCAL_Y = [-0.42, 0.0, 0.42];
+const BTN_REST = [
+  [-0.20, 0.052, 0.52],
+  [0.08, 0.052, 0.64],
+  [0.34, 0.052, 0.44]
+];
+const EYE_REST = [
+  [-0.26, 0.050, 0.60],
+  [0.06, 0.050, 0.70]
+];
+
+function update(t) {
+  /* ---------------- 雪地 ---------------- */
+  const snowLevel = track(t, [
+    [-1.0, 0.32], [-0.70, 0.55], [-0.35, 0.90], [-0.10, 1.0],
+    [0.00, 1.0], [0.45, 0.95], [0.75, 0.62], [0.92, 0.26], [1.0, 0.05]
+  ]);
+  const groundH = 0.185 * snowLevel;
+  const ga = groundGeo.attributes.position.array;
+  for (let i = 0; i < GV; i++) ga[i * 3 + 1] = gBase[i] * groundH;
+  groundGeo.attributes.position.needsUpdate = true;
+  groundGeo.computeVertexNormals();
+
+  const wet = sstep(0.12, 0.90, t);
+  groundMat.color.copy(COL_DRY_G).lerp(COL_WET_G, wet);
+  groundMat.roughness = lerp(0.92, 0.34, wet);
+  groundMat.metalness = lerp(0.0, 0.16, wet);
+
+  snowMat.color.copy(COL_DRY_S).lerp(COL_WET_S, wet);
+  snowMat.roughness = lerp(0.86, 0.20, wet);
+  snowMat.metalness = lerp(0.0, 0.10, wet);
+
+  /* ---------------- 水洼 ---------------- */
+  const puddleT = sstep(0.54, 0.96, t);
+  puddle.visible = puddleT > 0.002;
+  if (puddle.visible) {
+    const ps = lerp(0.28, 1.0, puddleT);
+    puddle.scale.set(ps, ps, 1);
+    puddleMat.opacity = 0.92 * puddleT;
+  }
+
+  /* ---------------- 身体 ---------------- */
+  const appear = sstep(-0.62, -0.10, t);       // 滚入
+  const bodySy = track(t, [
+    [-1, 1.0], [0.10, 1.0], [0.45, 0.80], [0.72, 0.45], [0.90, 0.14], [1.0, 0.02]
+  ]);
+  const bodySxz = track(t, [
+    [-1, 1.0], [0.10, 1.0], [0.45, 1.12], [0.72, 1.28], [0.90, 1.05], [1.0, 0.48]
+  ]);
+
+  const bScaleY = BODY_R * bodySy * appear;
+  const bScaleXZ = BODY_R * bodySxz * appear;
+  body.scale.set(bScaleXZ, bScaleY, bScaleXZ);
+  const sink = 0.60 * sstep(0.86, 1.0, t);
+  body.position.set(lerp(-0.95, 0, appear), bScaleY + 0.015 - sink, 0);
+
+  /* ---------------- 头 ---------------- */
+  const headDrop = sstep(-0.32, -0.02, t);
+  const dropFwd = sstep(0.42, 0.78, t);
+  const headMelt = lerp(1.0, 0.07, sstep(0.78, 1.0, t));
+  const dress = sstep(-0.22, -0.02, t);   // 雪人堆好以后才戴上眼睛、鼻子、纽扣、围巾和手臂
+
+  let headR = HEAD_R * headDrop * headMelt;
+  let hy = lerp(2.35, 1.50, headDrop) - 0.10 * sstep(0.10, 0.42, t);
+  let hx = lerp(0, 0.50, dropFwd);
+  let hz = lerp(0, 0.28, dropFwd);
+  hy = lerp(hy, headR + 0.02, dropFwd);
+
+  head.position.set(hx, hy, hz);
+  head.scale.setScalar(headR);
+
+  /* ---------------- 眼睛 ---------------- */
+  const partFall = sstep(0.55, 0.85, t);
+  const eyes = [eyeL, eyeR];
+  const eyeDirs = [EYE_DIR_L, EYE_DIR_R];
+  for (let i = 0; i < 2; i++) {
+    const d = eyeDirs[i];
+    const ax = head.position.x + d.x * headR * 0.92;
+    const ay = head.position.y + d.y * headR * 0.92;
+    const az = head.position.z + d.z * headR * 0.92;
+    const r = EYE_REST[i];
+    const arc = 0.10 * Math.sin(Math.PI * partFall);
+    eyes[i].position.set(
+      lerp(ax, r[0], partFall),
+      lerp(ay, r[1], partFall) + arc,
+      lerp(az, r[2], partFall)
+    );
+    eyes[i].scale.setScalar(Math.max(1e-4, lerp(0.052, 0.044, partFall) * dress));
+    eyes[i].visible = dress > 0.001;
+    eyes[i].rotation.set(t * 2.1 + i, t * 1.3 + i * 2, 0);
+  }
+
+  /* ---------------- 胡萝卜鼻子 ---------------- */
+  const noseFall = sstep(0.50, 0.86, t);
+  _dv.set(
+    lerp(NOSE_ATTACH.x, NOSE_REST.x, noseFall),
+    lerp(NOSE_ATTACH.y, NOSE_REST.y, noseFall),
+    lerp(NOSE_ATTACH.z, NOSE_REST.z, noseFall)
+  ).normalize();
+
+  const attachX = head.position.x + NOSE_ATTACH.x * headR * 0.72;
+  const attachY = head.position.y + NOSE_ATTACH.y * headR * 0.72;
+  const attachZ = head.position.z + NOSE_ATTACH.z * headR * 0.72;
+
+  nose.position.set(
+    lerp(attachX, 0.34, noseFall),
+    lerp(attachY, 0.055, noseFall) + 0.08 * Math.sin(Math.PI * noseFall),
+    lerp(attachZ, 0.58, noseFall)
+  );
+  _dq.setFromUnitVectors(_UP, _dv);
+  nose.quaternion.copy(_dq);
+  nose.scale.setScalar(Math.max(1e-4, dress));
+  nose.visible = dress > 0.001;
+
+  /* ---------------- 纽扣 ---------------- */
+  for (let i = 0; i < 3; i++) {
+    const ly = BTN_LOCAL_Y[i];
+    const lz = Math.sqrt(Math.max(0, 1 - ly * ly));
+    const ax = 0;
+    const ay = body.position.y + bScaleY * ly;
+    const az = bScaleXZ * lz * 0.94;
+
+    const r = BTN_REST[i];
+    const arc = 0.12 * Math.sin(Math.PI * partFall);
+    buttons[i].position.set(
+      lerp(ax, r[0], partFall),
+      lerp(ay, r[1], partFall) + arc,
+      lerp(az, r[2], partFall)
+    );
+    buttons[i].scale.setScalar(Math.max(1e-4, 0.048 * dress));
+    buttons[i].visible = dress > 0.001;
+    buttons[i].rotation.set(t * 1.7 + i * 1.9, t * 1.1 + i, 0.4);
+  }
+
+  /* ---------------- 围巾 ---------------- */
+  const scarfFall = sstep(0.42, 0.82, t);
+  scarfGroup.position.set(
+    lerp(0.0, 0.08, scarfFall),
+    lerp(1.14, 0.075, scarfFall),
+    lerp(0.0, 0.30, scarfFall)
+  );
+  scarfGroup.scale.set(
+    lerp(1.0, 1.15, scarfFall),
+    lerp(1.40, 0.42, scarfFall),
+    lerp(1.0, 1.15, scarfFall)
+  );
+  scarfGroup.rotation.y = lerp(0.0, 0.55, scarfFall);
+  scarfGroup.scale.multiplyScalar(Math.max(1e-4, dress));
+  scarfGroup.visible = dress > 0.001;
+
+  /* ---------------- 树枝手臂 ---------------- */
+  const armFall = sstep(0.45, 0.95, t);
+  const armFade = 1 - sstep(0.82, 1.0, t);
+
+  for (let side = 0; side < 2; side++) {
+    const arm = side === 0 ? armL : armR;
+    const dir = side === 0 ? ARM_DIR_L : ARM_DIR_R;
+
+    // 肩部（近似椭球表面）
+    const sx = body.position.x + dir.x * bScaleXZ * 0.90;
+    const sy = body.position.y + dir.y * bScaleY * 0.90;
+    const sz = body.position.z + dir.z * bScaleXZ * 0.90;
+
+    _tmpA.set(dir.x, dir.y - armFall * 1.15, dir.z).normalize();
+    _dq.setFromUnitVectors(_UP, _tmpA);
+
+    arm.position.set(
+      lerp(sx, sx * 1.05, armFall),
+      lerp(sy, sy - 0.45, armFall),
+      sz
+    );
+    arm.quaternion.copy(_dq);
+    arm.scale.setScalar(Math.max(0.0001, armFade * (0.35 + 0.65 * appear) * dress));
+    arm.visible = dress > 0.001;
+  }
+
+  /* ---------------- 雪花 ---------------- */
+  const flakeOpacity = track(t, [
+    [-1.0, 1.0], [-0.4, 0.95], [0.0, 0.55], [0.4, 0.22], [0.75, 0.04], [1.0, 0.0]
+  ]);
+  flakeMat.opacity = flakeOpacity;
+  snowPoints.visible = flakeOpacity > 0.003;
+
+  if (snowPoints.visible) {
+    const fa = flakeGeo.attributes.position.array;
+    for (let i = 0; i < FLAKES; i++) {
+      const f = flakeData[i];
+      let y = f.y0 - t * f.spd * 1.6;
+      y = y - Math.floor(y / FLAKE_BOX_Y) * FLAKE_BOX_Y;
+      fa[i * 3] = f.x + Math.sin(t * 2.5 + f.ph) * 0.07;
+      fa[i * 3 + 1] = y;
+      fa[i * 3 + 2] = f.z + Math.cos(t * 2.1 + f.ph * 1.7) * 0.07;
+    }
+    flakeGeo.attributes.position.needsUpdate = true;
+  }
+}
+
+/* ============================================================
+   7. 接口
+   ============================================================ */
+let curT = 0;
+let fps = 60;
+
+function getStages() {
+  return [
+    { t: -1.00, name: '初雪飘落' },
+    { t: -0.70, name: '积雪渐厚' },
+    { t: -0.30, name: '滚出雪球' },
+    { t: 0.00, name: '雪人完成' },
+    { t: 0.35, name: '开始消融' },
+    { t: 0.72, name: '头颅坠落' },
+    { t: 1.00, name: '一滩春水' }
+  ];
+}
+
+function setTime(v) {
+  const n = (typeof v === 'number' && isFinite(v)) ? v : 0;
+  curT = Math.max(-1, Math.min(1, n));
+  update(curT);
+  renderer.render(scene, camera);
+  syncUI();
+}
+
+window.setTime = setTime;
+window.getTime = () => curT;
+window.getStages = getStages;
+window.__timeState = () => ({ t: curT, fps: Math.round(fps) });
+
+window.addEventListener('message', e => {
+  if (e.data && e.data.type === 'timespell:setTime') setTime(e.data.t);
+});
+
+/* ============================================================
+   8. UI / 循环
+   ============================================================ */
+const sliderEl = document.getElementById('slider');
+const stageEl = document.getElementById('stageName');
+
+function syncUI() {
+  if (EMBED) return;
+  if (sliderEl) sliderEl.value = curT.toFixed(3);
+  if (stageEl) {
+    const st = getStages();
+    let best = st[0], bd = Infinity;
+    for (const s of st) { const d = Math.abs(s.t - curT); if (d < bd) { bd = d; best = s; } }
+    stageEl.textContent = best.name;
+  }
+}
+
+if (sliderEl) {
+  sliderEl.addEventListener('input', () => setTime(parseFloat(sliderEl.value)));
+}
+window.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') { setTime(curT - 0.01); e.preventDefault(); }
+  else if (e.key === 'ArrowRight') { setTime(curT + 0.01); e.preventDefault(); }
+});
+
+function onResize() {
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  updateCamera();
+  update(curT);
+  renderer.render(scene, camera);
+}
+window.addEventListener('resize', onResize);
+
+/* ---- 主循环（只负责渲染 + fps 统计） ---- */
+let lastT = 0, frameAcc = 0, frameCnt = 0;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (lastT) {
+    frameAcc += now - lastT;
+    frameCnt++;
+    if (frameCnt >= 20) {
+      const avg = frameAcc / frameCnt;
+      fps = avg > 0 ? 1000 / avg : 0;
+      frameAcc = 0; frameCnt = 0;
+    }
+  }
+  lastT = now;
+  renderer.render(scene, camera);
+}
+
+/* ---- 启动 ---- */
+updateCamera();
+setTime(0);
+requestAnimationFrame(loop);
+syncUI();
+
+/* ---- 通知宿主页面 ---- */
+window.parent.postMessage({ type: 'timespell:stages', stages: getStages() }, '*');
+</script>
+</body>
+</html>

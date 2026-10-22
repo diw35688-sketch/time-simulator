@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<style>html.ts-embed, html.ts-embed body { background: transparent !important; }</style>
+<script>if (new URLSearchParams(location.search).get('embed') === '1') document.documentElement.classList.add('ts-embed');</script>
+
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Time Object — Coffee</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #08090b; }
+  #ui {
+    position: fixed; left: 0; right: 0; bottom: 0; padding: 20px 0 26px;
+    display: flex; flex-direction: column; align-items: center; gap: 11px;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    pointer-events: none; user-select: none; z-index: 10;
+  }
+  #stage { color: #e8e2d6; font-size: 13px; letter-spacing: .24em; opacity: .82; text-shadow: 0 2px 14px #000; }
+  #range {
+    pointer-events: auto; -webkit-appearance: none; appearance: none;
+    width: min(560px, 68vw); height: 3px; border-radius: 2px; outline: none; cursor: pointer;
+    background: linear-gradient(90deg, #3a3226 0%, #7a6446 45%, #c9a878 100%);
+  }
+  #range::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: #f2ecdf; box-shadow: 0 0 12px #c9a878, 0 0 3px #000;
+  }
+  #range::-moz-range-thumb {
+    width: 14px; height: 14px; border: 0; border-radius: 50%;
+    background: #f2ecdf; box-shadow: 0 0 12px #c9a878;
+  }
+  #ticks {
+    display: flex; justify-content: space-between;
+    width: min(560px, 68vw); color: #7d766a; font-size: 10px; letter-spacing: .1em;
+  }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="stage">—</div>
+  <input id="range" type="range" min="-1" max="1" step="0.001" value="0" />
+  <div id="ticks"><span>过去</span><span>现在</span><span>未来</span></div>
+</div>
+
+<script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* =====================================================================
+   0. 基础工具
+   ===================================================================== */
+const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
+const sstep = (a, b, x) => { const u = clamp((x - a) / (b - a), 0, 1); return u * u * (3 - 2 * u); };
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+
+/* =====================================================================
+   1. 阶段 + 对外接口（先定义，构造完成后 ready=true 才真正生效）
+   ===================================================================== */
+const STAGES = [
+  { t: -1.00, name: '碟上咖啡豆' },
+  { t: -0.75, name: '研磨成粉' },
+  { t: -0.42, name: '一小堆咖啡粉' },
+  { t: -0.18, name: '注入热水' },
+  { t:  0.00, name: '一杯热咖啡' },
+  { t:  0.32, name: '热气散尽' },
+  { t:  0.68, name: '饮至半杯' },
+  { t:  1.00, name: '空杯残渍' },
+];
+
+let T = 0;
+let ready = false;
+let fpsVal = 60;
+
+function stageNameAt(t) {
+  let best = STAGES[0], bd = Infinity;
+  for (const s of STAGES) { const d = Math.abs(s.t - t); if (d < bd) { bd = d; best = s; } }
+  return best.name;
+}
+
+window.setTime = (v) => {
+  const n = Number(v);
+  T = clamp(Number.isFinite(n) ? n : 0, -1, 1);
+  if (ready) applyTime(T);
+};
+window.getTime = () => T;
+window.getStages = () => STAGES.map(s => ({ t: s.t, name: s.name }));
+window.__timeState = () => ({ t: T, fps: fpsVal });
+
+window.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'timespell:setTime') window.setTime(e.data.t);
+});
+
+/* =====================================================================
+   2. 渲染器 / 场景 / 相机 / 灯光
+   ===================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: EMBED, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.domElement.style.cssText = 'position:fixed;inset:0;display:block;';
+document.body.appendChild(renderer.domElement);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.08;
+renderer.localClippingEnabled = true;
+if (EMBED) renderer.setClearColor(0x000000, 0);
+
+const scene = new THREE.Scene();
+if (!EMBED) scene.background = new THREE.Color(0x0b0d11);
+
+const camera = new THREE.PerspectiveCamera(38, 1, 0.5, 200);
+
+/* ---- 三点布光 + 环境光 ---- */
+const hemi = new THREE.HemisphereLight(0x9db4d2, 0x1b1410, 0.55);
+scene.add(hemi);
+
+const keyLight = new THREE.DirectionalLight(0xfff2df, 2.7);
+keyLight.position.set(5.0, 7.0, 4.5);
+scene.add(keyLight);
+
+const fillLight = new THREE.DirectionalLight(0x8fb2dd, 1.05);
+fillLight.position.set(-6.0, 2.6, 3.4);
+scene.add(fillLight);
+
+const rimLight = new THREE.DirectionalLight(0xffd7a4, 2.4);
+rimLight.position.set(-2.5, 4.5, -6.5);
+scene.add(rimLight);
+
+/* ---- 程序化环境贴图（给陶瓷一点反射） ---- */
+function makeEnvTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createLinearGradient(0, 0, 0, 128);
+  g.addColorStop(0.00, '#2b313a');
+  g.addColorStop(0.42, '#161a1f');
+  g.addColorStop(1.00, '#07080a');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 256, 128);
+
+  let rg = ctx.createRadialGradient(72, 34, 1, 72, 34, 48);
+  rg.addColorStop(0, '#ffffff');
+  rg.addColorStop(0.22, 'rgba(226,236,250,0.62)');
+  rg.addColorStop(1, 'rgba(150,175,210,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0, 0, 256, 128);
+
+  rg = ctx.createRadialGradient(206, 58, 1, 206, 58, 44);
+  rg.addColorStop(0, 'rgba(255,228,190,0.72)');
+  rg.addColorStop(1, 'rgba(160,130,90,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0, 0, 256, 128);
+
+  rg = ctx.createRadialGradient(128, 118, 1, 128, 118, 62);
+  rg.addColorStop(0, 'rgba(60,70,88,0.55)');
+  rg.addColorStop(1, 'rgba(20,24,30,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0, 0, 256, 128);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+const envSrc = makeEnvTexture();
+const envRT = pmrem.fromEquirectangular(envSrc);
+scene.environment = envRT.texture;
+envSrc.dispose();
+pmrem.dispose();
+
+/* =====================================================================
+   3. 尺寸函数（杯子轮廓）
+   ===================================================================== */
+const CUP_BOT = 0.06, CUP_TOP = 1.01, CUP_H = CUP_TOP - CUP_BOT;
+
+function rOuter(y) {
+  const u = clamp((y - CUP_BOT) / CUP_H, 0, 1);
+  return 0.60 + 0.28 * Math.pow(u, 0.75) + 0.02 * Math.sin(Math.PI * u);
+}
+function rInner(y) {
+  const u = clamp((y - CUP_BOT) / CUP_H, 0, 1);
+  return rOuter(y) - 0.055 - 0.008 * u;
+}
+
+const Y_IN0 = 0.11;          // 杯内底高度
+const RI0 = rInner(Y_IN0);   // 杯内底半径
+
+/* =====================================================================
+   4. 陶瓷材质 & 碟子 / 杯子 / 把手
+   ===================================================================== */
+const ceramicMat = new THREE.MeshPhysicalMaterial({
+  color: 0xf4eee4,
+  roughness: 0.19,
+  metalness: 0.0,
+  clearcoat: 0.9,
+  clearcoatRoughness: 0.10,
+  side: THREE.DoubleSide,
+  envMapIntensity: 1.15,
+});
+
+/* ---------- 杯子 ---------- */
+const cupPts = [];
+cupPts.push(new THREE.Vector2(0.0015, Y_IN0));
+cupPts.push(new THREE.Vector2(RI0 * 0.55, Y_IN0));
+cupPts.push(new THREE.Vector2(RI0 * 0.90, Y_IN0 + 0.001));
+cupPts.push(new THREE.Vector2(RI0, Y_IN0 + 0.014));
+
+const NB = 26;
+for (let i = 1; i <= NB; i++) {
+  const y = Math.min(Y_IN0 + 0.014 + (CUP_TOP - Y_IN0 - 0.014) * (i / NB), CUP_TOP);
+  cupPts.push(new THREE.Vector2(rInner(y), y));
+}
+// 杯口圆唇
+cupPts.push(new THREE.Vector2(rInner(CUP_TOP) + 0.013, CUP_TOP + 0.006));
+cupPts.push(new THREE.Vector2((rInner(CUP_TOP) + rOuter(CUP_TOP)) * 0.5, CUP_TOP + 0.012));
+cupPts.push(new THREE.Vector2(rOuter(CUP_TOP) - 0.013, CUP_TOP + 0.006));
+// 外壁向下
+for (let i = NB; i >= 0; i--) {
+  const y = CUP_BOT + CUP_H * (i / NB);
+  cupPts.push(new THREE.Vector2(rOuter(y), y));
+}
+cupPts.push(new THREE.Vector2(0.0015, CUP_BOT));
+
+const cupMesh = new THREE.Mesh(new THREE.LatheGeometry(cupPts, 80), ceramicMat);
+scene.add(cupMesh);
+
+/* ---------- 把手 ---------- */
+const handleCurve = new THREE.CatmullRomCurve3([
+  new THREE.Vector3(0.78, 0.88, 0.00),
+  new THREE.Vector3(1.14, 0.90, 0.00),
+  new THREE.Vector3(1.34, 0.66, 0.00),
+  new THREE.Vector3(1.22, 0.36, 0.00),
+  new THREE.Vector3(0.62, 0.28, 0.00),
+]);
+const handleMesh = new THREE.Mesh(
+  new THREE.TubeGeometry(handleCurve, 46, 0.048, 12, false),
+  ceramicMat
+);
+scene.add(handleMesh);
+
+/* ---------- 碟子 ---------- */
+const saucerPts = [
+  [0.0015, 0.058], [0.28, 0.058], [0.58, 0.058], [0.74, 0.056],
+  [0.86, 0.052], [0.98, 0.054], [1.10, 0.068], [1.20, 0.096],
+  [1.28, 0.126], [1.315, 0.134], [1.325, 0.118], [1.305, 0.086],
+  [1.245, 0.052], [1.145, 0.026], [0.98, 0.011], [0.76, 0.004],
+  [0.45, 0.001], [0.0015, 0.001],
+].map(p => new THREE.Vector2(p[0], p[1]));
+
+const saucerMesh = new THREE.Mesh(new THREE.LatheGeometry(saucerPts, 88), ceramicMat);
+scene.add(saucerMesh);
+
+/* =====================================================================
+   5. 咖啡液体（圆柱 + 裁剪平面 + 液面圆盘）
+   ===================================================================== */
+const COFFEE_Y0 = 0.11;
+const COFFEE_Y1 = 0.94;
+
+const clipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), COFFEE_Y1);
+
+const coffeeGeo = new THREE.CylinderGeometry(0.800, 0.568, COFFEE_Y1 - COFFEE_Y0, 56, 1, true);
+coffeeGeo.translate(0, (COFFEE_Y0 + COFFEE_Y1) * 0.5, 0);
+
+const coffeeMat = new THREE.MeshPhysicalMaterial({
+  color: 0x241206,
+  roughness: 0.22,
+  metalness: 0.0,
+  clearcoat: 0.65,
+  clearcoatRoughness: 0.12,
+  side: THREE.DoubleSide,
+  clippingPlanes: [clipPlane],
+  envMapIntensity: 0.9,
+});
+const coffeeMesh = new THREE.Mesh(coffeeGeo, coffeeMat);
+scene.add(coffeeMesh);
+
+/* ---------- 咖啡液面纹理（深咖啡 + 奶油色油脂环） ---------- */
+function makeCoffeeTexture() {
+  const S = 512;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d');
+  const rng = mulberry32(90210);
+
+  ctx.fillStyle = '#1c0e05';
+  ctx.fillRect(0, 0, S, S);
+
+  let g = ctx.createRadialGradient(S * 0.5, S * 0.5, 0, S * 0.5, S * 0.5, S * 0.5);
+  g.addColorStop(0.00, 'rgba(8,4,2,0.85)');
+  g.addColorStop(0.42, 'rgba(46,24,10,0.45)');
+  g.addColorStop(0.75, 'rgba(74,40,18,0.20)');
+  g.addColorStop(1.00, 'rgba(30,15,6,0.0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, S, S);
+
+  // 奶油色油脂环
+  const ringR = S * 0.415;
+  for (let i = 0; i < 420; i++) {
+    const a = rng() * Math.PI * 2;
+    const rr = ringR + (rng() - 0.5) * S * 0.115;
+    const x = S * 0.5 + Math.cos(a) * rr;
+    const y = S * 0.5 + Math.sin(a) * rr;
+    const rad = 2.5 + rng() * 11;
+    const al = 0.05 + rng() * 0.20;
+    const rg = ctx.createRadialGradient(x, y, 0, x, y, rad);
+    rg.addColorStop(0, 'rgba(226,196,148,' + al.toFixed(3) + ')');
+    rg.addColorStop(1, 'rgba(196,158,108,0)');
+    ctx.fillStyle = rg;
+    ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fill();
+  }
+  // 环内细小泡沫颗粒
+  for (let i = 0; i < 320; i++) {
+    const a = rng() * Math.PI * 2;
+    const rr = Math.sqrt(rng()) * ringR;
+    const x = S * 0.5 + Math.cos(a) * rr;
+    const y = S * 0.5 + Math.sin(a) * rr;
+    const rad = 1 + rng() * 3.2;
+    ctx.fillStyle = 'rgba(190,155,110,' + (0.03 + rng() * 0.09).toFixed(3) + ')';
+    ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fill();
+  }
+  // 外缘一圈更亮的油光
+  for (let i = 0; i < 160; i++) {
+    const a = rng() * Math.PI * 2;
+    const rr = S * 0.455 + (rng() - 0.5) * S * 0.05;
+    const x = S * 0.5 + Math.cos(a) * rr;
+    const y = S * 0.5 + Math.sin(a) * rr;
+    const rad = 3 + rng() * 9;
+    const rg = ctx.createRadialGradient(x, y, 0, x, y, rad);
+    rg.addColorStop(0, 'rgba(238,214,176,' + (0.06 + rng() * 0.16).toFixed(3) + ')');
+    rg.addColorStop(1, 'rgba(220,190,150,0)');
+    ctx.fillStyle = rg;
+    ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fill();
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  return tex;
+}
+
+const surfGeo = new THREE.CircleGeometry(1, 64);
+surfGeo.rotateX(-Math.PI / 2);
+
+const surfMat = new THREE.MeshPhysicalMaterial({
+  map: makeCoffeeTexture(),
+  color: 0xffffff,
+  roughness: 0.16,
+  metalness: 0.0,
+  clearcoat: 0.75,
+  clearcoatRoughness: 0.09,
+  envMapIntensity: 1.0,
+});
+const surfMesh = new THREE.Mesh(surfGeo, surfMat);
+scene.add(surfMesh);
+
+/* =====================================================================
+   6. 杯壁 / 杯底的咖啡渍
+   ===================================================================== */
+const stainPts = [];
+stainPts.push(new THREE.Vector2(0.001, Y_IN0 + 0.002));
+stainPts.push(new THREE.Vector2(RI0 * 0.60, Y_IN0 + 0.002));
+stainPts.push(new THREE.Vector2(RI0 - 0.006, Y_IN0 + 0.008));
+for (let i = 1; i <= 22; i++) {
+  const y = Y_IN0 + (CUP_TOP - Y_IN0) * (i / 22);
+  stainPts.push(new THREE.Vector2(Math.max(0.01, rInner(y) - 0.005), y));
+}
+const stainGeo = new THREE.LatheGeometry(stainPts, 80);
+{
+  const sp = stainGeo.attributes.position;
+  const cols = new Float32Array(sp.count * 4);
+  for (let i = 0; i < sp.count; i++) {
+    const y = sp.getY(i);
+    const h = clamp((y - Y_IN0) / (CUP_TOP - Y_IN0), 0, 1);
+    const a = (1 - h) * (1 - h) * 0.95 + 0.05;
+    cols[i * 4 + 0] = 1; cols[i * 4 + 1] = 1; cols[i * 4 + 2] = 1;
+    cols[i * 4 + 3] = a;
+  }
+  stainGeo.setAttribute('color', new THREE.BufferAttribute(cols, 4));
+}
+const stainMat = new THREE.MeshStandardMaterial({
+  color: 0x3d1f0b,
+  roughness: 0.95,
+  metalness: 0.0,
+  vertexColors: true,
+  transparent: true,
+  opacity: 0,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+});
+const stainMesh = new THREE.Mesh(stainGeo, stainMat);
+stainMesh.renderOrder = 2;
+scene.add(stainMesh);
+
+/* =====================================================================
+   7. 咖啡豆
+   ===================================================================== */
+function makeBeanGeometry() {
+  const g = new THREE.SphereGeometry(1, 26, 20);
+  const arr = g.attributes.position.array;
+  for (let i = 0; i < arr.length; i += 3) {
+    const x = arr[i], y = arr[i + 1], z = arr[i + 2];
+    const X = x * 0.125;
+    const Y = y * 0.085;
+    const Z = z * 0.098;
+    const crease = Math.exp(-(Z * Z) / 0.0012);
+    const along = 1 - Math.min(1, (X / 0.125) * (X / 0.125));
+    const dY = 0.036 * crease * along * Math.max(0, y);
+    arr[i] = X;
+    arr[i + 1] = Y - dY;
+    arr[i + 2] = Z;
+  }
+  g.computeVertexNormals();
+  g.computeBoundingSphere();
+  return g;
+}
+
+const beanGeo = makeBeanGeometry();
+const beanMat = new THREE.MeshStandardMaterial({
+  color: 0x4a2a15,
+  roughness: 0.52,
+  metalness: 0.03,
+  envMapIntensity: 0.8,
+});
+
+const beanRng = mulberry32(20240617);
+const beans = [];
+for (let i = 0; i < 7; i++) {
+  const ang = (i / 7) * Math.PI * 2 + 0.42 + (beanRng() - 0.5) * 0.55;
+  const rad = 0.84 + beanRng() * 0.24;
+  const bx = Math.cos(ang) * rad;
+  const bz = Math.sin(ang) * rad;
+  const by = 0.132;
+
+  const mesh = new THREE.Mesh(beanGeo, beanMat);
+  mesh.position.set(bx, by, bz);
+  mesh.rotation.set(
+    (beanRng() - 0.5) * 0.55,
+    beanRng() * Math.PI * 2,
+    (beanRng() - 0.5) * 0.55
+  );
+  const s = 0.85 + beanRng() * 0.35;
+  mesh.scale.setScalar(s);
+  scene.add(mesh);
+  beans.push({ mesh: mesh, s: s });
+}
+
+/* =====================================================================
+   8. 咖啡粉堆
+   ===================================================================== */
+function makePowderGeometry() {
+  const g = new THREE.SphereGeometry(1, 30, 16, 0, Math.PI * 2, 0, Math.PI * 0.5);
+  const arr = g.attributes.position.array;
+  for (let i = 0; i < arr.length; i += 3) {
+    const x = arr[i], y = arr[i + 1], z = arr[i + 2];
+    const n = 1 + Math.sin(x * 9.1 + z * 7.3) * 0.055 + Math.sin(z * 13.7 - x * 5.1) * 0.045;
+    arr[i] = x * n;
+    arr[i + 1] = y * (1 + Math.sin(x * 6.2 + z * 4.4) * 0.14);
+    arr[i + 2] = z * n;
+  }
+  g.computeVertexNormals();
+  g.computeBoundingSphere();
+  return g;
+}
+
+const powderMat = new THREE.MeshStandardMaterial({
+  color: 0x3b2210,
+  roughness: 0.98,
+  metalness: 0.0,
+  envMapIntensity: 0.5,
+});
+const powderMesh = new THREE.Mesh(makePowderGeometry(), powderMat);
+powderMesh.position.set(0.86, 0.052, 0.38);
+powderMesh.scale.set(0.30, 0.11, 0.30);
+scene.add(powderMesh);
+
+/* =====================================================================
+   9. 热气（三条带状曲面）
+   ===================================================================== */
+const STEAM_SEG = 26;
+const STEAM_COUNT = 3;
+const steamRibbons = [];
+
+for (let s = 0; s < STEAM_COUNT; s++) {
+  const nv = (STEAM_SEG + 1) * 2;
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(nv * 3);
+  const alp = new Float32Array(nv);
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aAlpha', new THREE.BufferAttribute(alp, 1));
+
+  const idx = [];
+  for (let i = 0; i < STEAM_SEG; i++) {
+    const a = i * 2, b = i * 2 + 1, c = (i + 1) * 2, d = (i + 1) * 2 + 1;
+    idx.push(a, b, c, b, d, c);
+  }
+  geo.setIndex(idx);
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: new THREE.Color(0xd9e3ec) },
+      uOpacity: { value: 0.0 },
+    },
+    vertexShader: `
+      attribute float aAlpha;
+      varying float vA;
+      void main() {
+        vA = aAlpha;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 uColor;
+      uniform float uOpacity;
+      varying float vA;
+      void main() {
+        float a = vA * uOpacity;
+        if (a < 0.002) discard;
+        gl_FragColor = vec4(uColor, a);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    blending: THREE.NormalBlending,
+  });
+
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 6;
+  scene.add(mesh);
+
+  steamRibbons.push({ mesh: mesh, geo: geo, pos: pos, alp: alp, mat: mat });
+}
+
+/* =====================================================================
+   10. 时间驱动 —— 唯一会修改画面的函数
+   ===================================================================== */
+function applyTime(t) {
+  /* ---- 各要素的时间包络 ---- */
+  const eBean  = 1 - sstep(-0.80, -0.60, t);                                // 豆子存在度
+  const ePow   = sstep(-0.84, -0.66, t) * (1 - sstep(-0.34, -0.13, t));     // 咖啡粉存在度
+  const eLevel = sstep(-0.30, -0.03, t) * (1 - sstep(0.28, 0.97, t));       // 液面高度 0..1
+  const eSteam = sstep(-0.34, -0.08, t) * (1 - sstep(0.02, 0.34, t));       // 热气浓度
+  const eStain = sstep(0.42, 0.96, t);                                      // 咖啡渍
+
+  /* ---- 咖啡豆 ---- */
+  for (let i = 0; i < beans.length; i++) {
+    const b = beans[i];
+    const k = b.s * eBean;
+    b.mesh.scale.setScalar(Math.max(k, 0.0001));
+    b.mesh.visible = eBean > 0.004;
+  }
+
+  /* ---- 咖啡粉 ---- */
+  const ps = 0.02 + 0.98 * ePow;
+  powderMesh.scale.set(0.30 * ps, 0.11 * ps, 0.30 * ps);
+  powderMesh.visible = ePow > 0.004;
+
+  /* ---- 液面 ---- */
+  const levelY = 0.115 + eLevel * 0.815;
+  clipPlane.constant = levelY;
+
+  const liquidVisible = eLevel > 0.005;
+  coffeeMesh.visible = liquidVisible;
+  surfMesh.visible = liquidVisible;
+
+  if (liquidVisible) {
+    const rl = rInner(clamp(levelY, CUP_BOT, CUP_TOP)) * 1.012;
+    surfMesh.position.y = levelY;
+    surfMesh.scale.set(rl, 1, rl);
+  }
+
+  /* ---- 咖啡渍 ---- */
+  stainMat.opacity = eStain * 0.86;
+  stainMesh.visible = eStain > 0.004;
+
+  /* ---- 热气 ---- */
+  const H = 0.95;
+  for (let s = 0; s < STEAM_COUNT; s++) {
+    const rb = steamRibbons[s];
+    rb.mesh.visible = eSteam > 0.004;
+
+    if (!rb.mesh.visible) continue;
+
+    const baseAng = s * 2.0943951 + 0.5;
+    const x0 = Math.cos(baseAng) * 0.26;
+    const z0 = Math.sin(baseAng) * 0.26;
+    const tx = -Math.sin(baseAng);
+    const tz = Math.cos(baseAng);
+    const phase = t * 3.4 + s * 2.1;
+
+    const pos = rb.pos, alp = rb.alp;
+    for (let i = 0; i <= STEAM_SEG; i++) {
+      const u = i / STEAM_SEG;
+      const uu = Math.pow(u, 0.9);
+
+      const cx = x0 + 0.15 * Math.sin(u * 4.6 + phase) * uu;
+      const cz = z0 + 0.11 * Math.cos(u * 3.8 + phase * 1.27) * uu;
+      const cy = 0.96 + u * H;
+      const w = 0.030 + 0.095 * u;
+
+      const i6 = i * 6;
+      pos[i6 + 0] = cx + tx * w;
+      pos[i6 + 1] = cy;
+      pos[i6 + 2] = cz + tz * w;
+      pos[i6 + 3] = cx - tx * w;
+      pos[i6 + 4] = cy;
+      pos[i6 + 5] = cz - tz * w;
+
+      const a = Math.pow(1 - u, 0.9) * sstep(0, 0.09, u);
+      alp[i * 2] = a;
+      alp[i * 2 + 1] = a;
+    }
+    rb.geo.attributes.position.needsUpdate = true;
+    rb.geo.attributes.aAlpha.needsUpdate = true;
+    rb.mat.uniforms.uOpacity.value = eSteam * 0.42;
+  }
+}
+
+/* =====================================================================
+   11. 相机布局（保证物体落在画面 (50%,60%) 的方框内）
+   ===================================================================== */
+const CAM_DIR = new THREE.Vector3(0.5156, 0.4384, 0.7363).normalize();
+const CAM_ELEV_COS = Math.cos(Math.asin(CAM_DIR.y)); // ≈ cos(仰角)
+
+function updateCamera() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const aspect = w / Math.max(h, 1);
+
+  const factor = EMBED ? 0.35 : 0.52;   // 物体最大尺寸 / min(宽,高)
+
+  // 世界坐标下的近似包围尺寸（含热气）
+  const itemH = 2.95;
+  const itemW = 2.80;
+
+  const needH = itemH / factor;
+  const needW = itemW / factor;
+  const visibleH = Math.max(needH, needW / aspect);
+
+  const vFov = THREE.MathUtils.degToRad(camera.fov);
+  const dist = visibleH / (2 * Math.tan(vFov / 2));
+
+  // 让物体中心投影到屏幕 (50%, 60%)
+  const centerY = 0.95;
+  const dy = 0.10 * visibleH / CAM_ELEV_COS;
+  const target = new THREE.Vector3(0, centerY + dy, 0);
+
+  camera.position.copy(target).addScaledVector(CAM_DIR, dist);
+  camera.up.set(0, 1, 0);
+  camera.lookAt(target);
+  camera.aspect = aspect;
+  camera.near = Math.max(0.5, dist * 0.08);
+  camera.far = dist * 4.0;
+  camera.updateProjectionMatrix();
+}
+
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(w, h);
+  updateCamera();
+}
+window.addEventListener('resize', onResize);
+updateCamera();
+
+/* =====================================================================
+   12. 独立模式 UI
+   ===================================================================== */
+const uiEl = document.getElementById('ui');
+const stageEl = document.getElementById('stage');
+const rangeEl = document.getElementById('range');
+
+if (EMBED) {
+  uiEl.style.display = 'none';
+} else {
+  rangeEl.addEventListener('input', () => window.setTime(parseFloat(rangeEl.value)));
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') { window.setTime(T - 0.02); e.preventDefault(); }
+    else if (e.key === 'ArrowRight') { window.setTime(T + 0.02); e.preventDefault(); }
+  });
+}
+
+let lastShownStage = '';
+function syncUI() {
+  if (EMBED) return;
+  if (parseFloat(rangeEl.value) !== T) rangeEl.value = String(T);
+  const nm = stageNameAt(T);
+  if (nm !== lastShownStage) { lastShownStage = nm; stageEl.textContent = nm; }
+}
+
+/* =====================================================================
+   13. 启动
+   ===================================================================== */
+ready = true;
+applyTime(T);
+syncUI();
+
+/* fps 统计（只用于 __timeState，不影响画面） */
+let lastFrameTime = performance.now();
+let fpsAcc = 0, fpsCnt = 0;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+
+  const dt = now - lastFrameTime;
+  lastFrameTime = now;
+  if (dt > 0 && dt < 2000) {
+    fpsAcc += dt; fpsCnt++;
+    if (fpsAcc >= 400) { fpsVal = 1000 * fpsCnt / fpsAcc; fpsAcc = 0; fpsCnt = 0; }
+  }
+
+  syncUI();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(loop);
+
+/* 通知宿主页面阶段列表（只发一次） */
+try {
+  window.parent.postMessage({ type: 'timespell:stages', stages: window.getStages() }, '*');
+} catch (err) { /* 忽略 */ }
+</script>
+</body>
+</html>

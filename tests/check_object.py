@@ -9,6 +9,23 @@ from _static import BASE, serve
 
 PATH = sys.argv[1].replace(chr(92), '/').lstrip('./')
 W, H = 1280, 720
+SCRUB_JS = """async () => {
+  const frame = () => new Promise(r => requestAnimationFrame(r)), heap = () => (performance.memory ? performance.memory.usedJSHeapSize : 0);
+  for (let i = 0; i < 30; i++) { window.setTime(Math.sin(i / 12)); await frame(); }
+  const mem0 = heap(), times = []; let last = performance.now();
+  for (let i = 0; i < 240; i++) { window.setTime(Math.sin(i / 12)); await frame(); const now = performance.now(); times.push(now - last); last = now; }
+  const mem1 = heap(); times.sort((a, b) => a - b);
+  return { avgMs: +(times.reduce((s, v) => s + v, 0) / times.length).toFixed(1), p95Ms: +times[Math.floor(times.length * .95)].toFixed(1), heapGrowMB: +((mem1 - mem0) / 1e6).toFixed(1) };
+}"""
+
+
+def objdiff(a, b):
+    # 只在物品所在的区域（任一帧不透明的像素）里比较，按透明度预乘，避免细长的物品被整屏平均稀释
+    mask = (a[..., 3] > 10) | (b[..., 3] > 10)
+    if not mask.any():
+        return 0.0
+    pa, pb = a[..., :3] * (a[..., 3:] / 255), b[..., :3] * (b[..., 3:] / 255)
+    return round(float(np.abs(pa - pb)[mask].mean()), 2)
 
 
 async def check(b, mode):
@@ -37,8 +54,10 @@ async def check(b, mode):
     r = {'canvas_count': await pg.evaluate("document.querySelectorAll('canvas').length"), 'errors': errs, 'external_requests': external,
          'fps': round((await pg.evaluate('window.__timeState?.().fps')) or 0),
          'purity_px_changed%': round((np.abs(a - c).max(2) > 2).mean() * 100, 3),
-         'diff_-1_vs_0': round(float(np.abs(m1[..., :3] - z[..., :3]).mean()), 2), 'diff_+1_vs_0': round(float(np.abs(p1[..., :3] - z[..., :3]).mean()), 2),
+         'diff_-1_vs_0': objdiff(m1, z), 'diff_+1_vs_0': objdiff(p1, z),
          'stages': await pg.evaluate('window.getStages ? window.getStages().map(s => s.t + ":" + s.name) : null')}
+    # 拨动时宿主每帧调用一次 setTime：连续扫 120 帧，量每帧耗时和内存增长
+    r['scrub'] = await pg.evaluate(SCRUB_JS)
     await pg.evaluate("window.postMessage({ type: 'timespell:setTime', t: 0.33 }, '*')")
     await pg.wait_for_timeout(200)
     r['postMessage_ok'] = abs(await pg.evaluate('window.getTime()') - .33) < 1e-6
@@ -65,9 +84,10 @@ def verdict(s, e):
         '2 帧率≥30': ok(min(s.get('fps', 0), e.get('fps', 0)) >= 30),
         '3 纯函数（往回拨逐像素复原）': ok(s.get('purity_px_changed%') == 0 and e.get('purity_px_changed%') == 0),
         '4 嵌入模式透明、无 UI': ok(e.get('corner_alpha_max') == 0 and not e.get('visible_ui') and e.get('t0_center') is not None),
-        '5 过去/现在/未来明显不同': ok(min(e.get('diff_-1_vs_0', 0), e.get('diff_+1_vs_0', 0)) > 0.5),
+        '5 过去/现在/未来明显不同': ok(min(e.get('diff_-1_vs_0', 0), e.get('diff_+1_vs_0', 0)) > 8),
         '6 无外部请求': ok(not s.get('external_requests') and not e.get('external_requests')),
         '接口 postMessage / 截断': ok(s.get('postMessage_ok') and s.get('clamp_ok')),
+        '7 拨动流畅（每帧平均 ≤20ms，内存不涨）': ok(all(x.get('scrub') and x['scrub']['avgMs'] <= 20 and x['scrub']['heapGrowMB'] < 20 for x in (s, e))),
     }
     return out
 

@@ -9,7 +9,8 @@ from _static import BASE, serve
 VIDEO = pathlib.Path(tempfile.gettempdir()) / 'timesim-hand' / 'hand.y4m'
 CONFIGS = {'auto': ('后台线程，CPU 先用、GPU 好了切换', ''), 'cpu': ('后台线程，只用 CPU', '?delegate=cpu'), 'main': ('主线程（旧方式）', '?detector=main')}
 # 录制时间 r（ms）≈ 视频时间 - 2000（从手出现开始录）
-WINDOWS = {'still': (600, 1900), 'lockA': (600, 1900), 'lockO': (3500, 3950), 'after60': (6400, 6950), 'back': (9400, 9950), 'after30': (12400, 12950)}
+OBJ = next((a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--object=')), None)   # 换一个物品测
+WINDOWS = {'still': (300, 1500), 'lockA': (300, 1500), 'lockO': (3500, 3950), 'after60': (6400, 6950), 'back': (9400, 9950), 'after30': (12400, 12950)}
 
 
 async def run(p, key):
@@ -21,7 +22,7 @@ async def run(p, key):
     pg = await ctx.new_page()
     errs = []
     pg.on('pageerror', lambda e: errs.append(str(e)[:160]))
-    await pg.goto(f'{BASE}/index.html{query}')
+    await pg.goto(f'{BASE}/index.html{query}' + (('&' if query else '?') + 'object=' + OBJ if OBJ else ''))
     await pg.wait_for_function("window.__timespell && window.__timespell().handStatus.startsWith('就绪')", timeout=90000)
     # 自动模式要等 GPU 和手臂识别都预热好（第一次打开要二三十秒），再对齐到视频里“手出现”的那一刻
     if key == 'auto':
@@ -71,7 +72,7 @@ def report(res):
     rowsdef = [('status', '识别状态', str), ('rate', '识别次数/秒（全程平均）', '{:.1f}'), ('cost', '单帧识别耗时 ms', '{:.0f}'), ('latency', '采集到结果的延迟 ms', '{:.0f}'),
                ('p50', '画面帧间隔中位数 ms', '{:.1f}'), ('p95', '帧间隔 95% 分位 ms', '{:.1f}'), ('p99', '帧间隔 99% 分位 ms', '{:.1f}'),
                ('over25', '超过 25ms 的卡顿帧', '{}'), ('longTasks', '主线程长任务（>50ms）', '{}'), ('jitter', '手静止时法阵抖动 px', '{:.2f}'),
-               ('lockA', '离物品远时误锁定', '{}'), ('lockO', '手在物品上时一直锁定', '{}'),
+               ('lockA', '离物品远也能控制', '{}'), ('lockO', '手在物品上时一直锁定', '{}'),
                ('after60', '顺时针 60° 后时间（应≈0.79）', '{:.3f}'), ('back', '转回后时间（应≈0）', '{:.3f}'), ('after30', '再转 30° 后（应≈0.39）', '{:.3f}'),
                ('ghost', '重影法阵亮度', '{:.2f}'), ('errors', '页面报错', '{}')]
     for key, label, fmt in rowsdef:

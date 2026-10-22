@@ -11,6 +11,7 @@ import argparse, base64, json, pathlib, re, sys, time, urllib.error, urllib.requ
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import aiconf
+from objfix import ensure_embed_transparent
 
 TEMPLATE = aiconf.ROOT / 'prompts' / 'object_task.md'
 SYSTEM = '你是资深 three.js 图形工程师。只输出一个完整的 ```html 代码块，然后用一句话说明阶段设计。'
@@ -68,7 +69,8 @@ def obj(conf, a):
     m = re.search(r'```html\s*(.*?)```', text, re.S)
     if not m:
         sys.exit(f'回复里没有 html 代码块，原文在 {out.with_suffix(".raw.md")}')
-    out.write_text(m.group(1).strip() + '\n', encoding='utf8')
+    html, _ = ensure_embed_transparent(m.group(1).strip() + chr(10))
+    out.write_text(html, encoding='utf8')
     print(json.dumps({'output': str(out), 'chars': len(m.group(1)), 'usage': d.get('usage'), 'seconds': round(time.time() - t0, 1),
                       'note': text[m.end():].strip()[:300]}, ensure_ascii=False))
 

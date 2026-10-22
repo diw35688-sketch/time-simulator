@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<style>html.ts-embed, html.ts-embed body { background: transparent !important; }</style>
+<script>if (new URLSearchParams(location.search).get('embed') === '1') document.documentElement.classList.add('ts-embed');</script>
+
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+<title>ice</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#060a10;overflow:hidden;}
+  canvas{position:fixed;inset:0;display:block;}
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:12px 18px 20px;display:flex;flex-direction:column;
+      align-items:center;gap:8px;pointer-events:none;
+      font-family:ui-sans-serif,system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+      color:#cfe6f5;}
+  #ui .stage{font-size:13px;letter-spacing:.06em;opacity:.9;text-shadow:0 1px 8px #000;}
+  #ui input{width:min(560px,82vw);pointer-events:auto;accent-color:#7fd4ff;}
+</style>
+</head>
+<body>
+<script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* =========================================================
+   0. helpers
+   ========================================================= */
+const clamp = (x,a,b)=> x<a?a:(x>b?b:x);
+const sstep = (a,b,x)=>{ if(a===b) return x<a?0:1; const u=clamp((x-a)/(b-a),0,1); return u*u*(3-2*u); };
+const mix   = (a,b,u)=> a+(b-a)*u;
+
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+
+/* =========================================================
+   1. public API  (defined immediately, before any heavy work)
+   ========================================================= */
+const STAGES = [
+  { t:-1.00, name:'一汪清水' },
+  { t:-0.72, name:'水面浮出放射状冰晶' },
+  { t:-0.30, name:'冻成棱角分明的冰块' },
+  { t: 0.00, name:'半透明冰块 · 气泡与高光' },
+  { t: 0.35, name:'棱角融化 · 表面挂满水珠' },
+  { t: 0.62, name:'缩成一小块浮在水里' },
+  { t: 0.84, name:'只剩一汪水' },
+  { t: 1.00, name:'水蒸发 · 只留一圈水痕' }
+];
+
+let currentT = 0;
+let ready = false;
+let fps = 60;
+
+window.setTime = function(v){
+  const n = Number(v);
+  currentT = clamp(isFinite(n) ? n : 0, -1, 1);
+  if (ready){ apply(currentT); render(); syncUI(); }
+};
+window.getTime = ()=> currentT;
+window.getStages = ()=> STAGES;
+window.__timeState = ()=> ({ t: currentT, fps });
+window.addEventListener('message', e=>{
+  if (e && e.data && e.data.type === 'timespell:setTime') window.setTime(e.data.t);
+});
+
+/* =========================================================
+   2. renderer / scene / camera
+   ========================================================= */
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha: EMBED, powerPreference:'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.02;
+if (EMBED) renderer.setClearColor(0x000000, 0);
+else       renderer.setClearColor(0x060a10, 1);
+renderer.domElement.style.cssText = 'position:fixed;inset:0;display:block;';
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+if (!EMBED) scene.background = new THREE.Color(0x060a10);
+
+const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 200);
+
+/* =========================================================
+   3. procedural environment map (no external files)
+   ========================================================= */
+function buildEnvTexture(){
+  const envScene = new THREE.Scene();
+  envScene.background = new THREE.Color(0x0a1420);
+
+  const panel = (hex, intensity, w, h, p)=>{
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial());
+    m.material.color.setHex(hex).multiplyScalar(intensity);
+    m.position.set(p[0], p[1], p[2]);
+    m.lookAt(0, 0, 0);
+    envScene.add(m);
+  };
+  panel(0xffffff, 7.0, 14,  9, [ 0, 15,  6]);   // top softbox
+  panel(0x86c8ff, 3.0,  9, 16, [-13,  4,  3]);  // cool left
+  panel(0xffcf9a, 3.4,  9, 11, [ 3,  6,-13]);   // warm back rim
+  panel(0x1d3a5c, 1.2, 24, 24, [ 0,-14,  0]);   // floor bounce
+  panel(0x8fd8ff, 1.6, 12, 12, [10,  2,-6]);    // specular kicker
+
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const rt = pmrem.fromScene(envScene, 0.06);
+  pmrem.dispose();
+  envScene.traverse(o=>{ if(o.isMesh){ o.geometry.dispose(); o.material.dispose(); } });
+  return rt.texture;
+}
+scene.environment = buildEnvTexture();
+
+/* =========================================================
+   4. lights (three point + ambient)
+   ========================================================= */
+scene.add(new THREE.AmbientLight(0x2a3f55, 1.4));
+
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.6);
+keyLight.position.set(4.5, 7.5, 6.0);
+scene.add(keyLight);
+
+const fillLight = new THREE.DirectionalLight(0x86bfff, 1.2);
+fillLight.position.set(-6.5, 2.5, 3.5);
+scene.add(fillLight);
+
+const rimLight = new THREE.DirectionalLight(0xffd9a8, 2.4);
+rimLight.position.set(-3.0, 4.5, -7.0);
+scene.add(rimLight);
+
+const rimLight2 = new THREE.DirectionalLight(0xa8e0ff, 1.3);
+rimLight2.position.set(6.5, 2.0, -4.5);
+scene.add(rimLight2);
+
+const spark = new THREE.PointLight(0xffffff, 22, 0, 2);
+spark.position.set(2.4, 2.6, 2.8);
+scene.add(spark);
+
+/* =========================================================
+   5. geometry / materials
+   ========================================================= */
+const root = new THREE.Group();
+scene.add(root);
+
+const WATER_Y = 0.075;
+
+/* ---------- 5.1 shallow round glass dish (lathe) ---------- */
+const dishProfile = [
+  [0.000, 0.000],[0.200, 0.002],[0.400, 0.005],[0.600, 0.010],
+  [0.750, 0.018],[0.850, 0.040],[0.910, 0.085],[0.945, 0.140],
+  [0.960, 0.175],[0.978, 0.180],[0.990, 0.168],[0.978, 0.118],
+  [0.940, 0.058],[0.870, 0.012],[0.720,-0.020],[0.500,-0.036],
+  [0.250,-0.044],[0.000,-0.048]
+];
+const dishPts = dishProfile.map(p=> new THREE.Vector2(p[0], p[1]));
+const dishGeo = new THREE.LatheGeometry(dishPts, 96);
+
+const glassMat = new THREE.MeshPhysicalMaterial({
+  color: 0xd6ecf8, metalness: 0.0, roughness: 0.055,
+  transparent: true, opacity: 0.20, side: THREE.DoubleSide,
+  envMapIntensity: 1.7, clearcoat: 1.0, clearcoatRoughness: 0.02,
+  depthWrite: false
+});
+const dishMesh = new THREE.Mesh(dishGeo, glassMat);
+dishMesh.renderOrder = 0;
+root.add(dishMesh);
+
+/* ---------- 5.2 water pool in the dish ---------- */
+const waterGeo = new THREE.CircleGeometry(1, 80);
+waterGeo.rotateX(-Math.PI/2);
+const waterMat = new THREE.MeshPhysicalMaterial({
+  color: 0x7cc6e8, metalness: 0.0, roughness: 0.02,
+  transparent: true, opacity: 0.55, side: THREE.DoubleSide,
+  envMapIntensity: 1.9, clearcoat: 1.0, clearcoatRoughness: 0.01,
+  depthWrite: false
+});
+const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+waterMesh.position.y = WATER_Y;
+waterMesh.renderOrder = 1;
+root.add(waterMesh);
+
+/* ---------- 5.3 ice body (superellipsoid morph) ---------- */
+const ICE_SEG_W = 64, ICE_SEG_H = 40;
+const iceGeo = new THREE.SphereGeometry(1, ICE_SEG_W, ICE_SEG_H);
+const iceBasePos = iceGeo.attributes.position.array.slice(0);
+const icePosAttr  = iceGeo.attributes.position;
+const iceNormAttr = iceGeo.attributes.normal;
+
+const iceMat = new THREE.MeshPhysicalMaterial({
+  color: 0xdff2ff, metalness: 0.0, roughness: 0.045,
+  transparent: true, opacity: 0.5, side: THREE.DoubleSide,
+  envMapIntensity: 2.8, clearcoat: 1.0, clearcoatRoughness: 0.015,
+  ior: 1.31, depthWrite: false
+});
+const iceMesh = new THREE.Mesh(iceGeo, iceMat);
+iceMesh.frustumCulled = false;
+iceMesh.renderOrder = 2;
+root.add(iceMesh);
+
+const WATER_COL = new THREE.Color(0x8ecfe8);
+const ICE_COL   = new THREE.Color(0xe8f8ff);
+
+/* ---------- 5.4 radial frost / crystal pattern ---------- */
+const frostGeo = new THREE.CircleGeometry(1, 96);
+frostGeo.rotateX(-Math.PI/2);
+
+const frostMat = new THREE.ShaderMaterial({
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+  uniforms: {
+    uProgress: { value: 0 },
+    uOpacity:  { value: 0 }
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main(){
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform float uProgress;
+    uniform float uOpacity;
+
+    float hash(vec2 p){
+      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+    }
+    float vnoise(vec2 p){
+      vec2 i = floor(p), f = fract(p);
+      f = f*f*(3.0-2.0*f);
+      float a = hash(i);
+      float b = hash(i + vec2(1.0, 0.0));
+      float c = hash(i + vec2(0.0, 1.0));
+      float d = hash(i + vec2(1.0, 1.0));
+      return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+    }
+
+    void main(){
+      vec2 p = vUv - 0.5;
+      float r = length(p) * 2.0;
+      if (r > 1.0) discard;
+
+      float ang = atan(p.y, p.x);
+      const float TAU = 6.28318530718;
+      const float ARMS = 12.0;
+
+      float a1 = abs(fract(ang / TAU * ARMS + 0.5) - 0.5) * 2.0;
+      float arm = smoothstep(0.10, 0.0, a1);
+
+      float a2 = abs(fract(ang / TAU * ARMS * 2.0) - 0.5) * 2.0;
+      float sub = smoothstep(0.06, 0.0, a2);
+
+      float dash = pow(abs(sin(r * 14.0 + 1.3)), 8.0);
+      float sideMask = smoothstep(0.08, 0.35, r) * (1.0 - smoothstep(0.55, 0.92, r));
+      float crystal = arm * (0.75 + 0.45 * dash) + sub * sideMask * 0.55;
+
+      float fuzz = vnoise(p * 26.0) * 0.10 * smoothstep(0.15, 0.9, r);
+      crystal += fuzz;
+
+      float lim  = uProgress;
+      float mask = smoothstep(lim + 0.02, lim - 0.28, r);
+      float edgeFade = smoothstep(1.0, 0.86, r);
+      float glow = smoothstep(0.45, 0.0, r) * 0.30;
+
+      float a = clamp((crystal + glow) * mask * edgeFade * uOpacity, 0.0, 1.0);
+      vec3 col = mix(vec3(0.50, 0.78, 1.0), vec3(1.0), clamp(crystal, 0.0, 1.0));
+      gl_FragColor = vec4(col, a);
+    }
+  `
+});
+const frostMesh = new THREE.Mesh(frostGeo, frostMat);
+frostMesh.position.y = WATER_Y + 0.008;
+frostMesh.renderOrder = 3;
+root.add(frostMesh);
+
+/* ---------- 5.5 bubbles inside the ice ---------- */
+let lcgSeed = 20240215;
+function lcg(){
+  lcgSeed = (Math.imul(lcgSeed, 1664525) + 1013904223) >>> 0;
+  return lcgSeed / 4294967296;
+}
+function randDir(minY){
+  let x, y, z, len;
+  do {
+    const u = lcg() * 2 - 1;
+    const phi = lcg() * Math.PI * 2;
+    const s = Math.sqrt(Math.max(0, 1 - u * u));
+    x = s * Math.cos(phi); y = u; z = s * Math.sin(phi);
+    len = 1;
+  } while (y < minY);
+  return new THREE.Vector3(x / len, y / len, z / len);
+}
+
+const BUBBLE_N = 22;
+const bubbleData = [];
+for (let i = 0; i < BUBBLE_N; i++){
+  bubbleData.push({
+    dir: randDir(-0.95),
+    k: 0.18 + lcg() * 0.58,
+    size: 0.012 + lcg() * 0.030
+  });
+}
+const bubbleGeo = new THREE.IcosahedronGeometry(1, 1);
+const bubbleMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 0.25, metalness: 0.0, envMapIntensity: 2.4
+});
+const bubbleMesh = new THREE.InstancedMesh(bubbleGeo, bubbleMat, BUBBLE_N);
+bubbleMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+bubbleMesh.frustumCulled = false;
+root.add(bubbleMesh);
+
+/* ---------- 5.6 water droplets on the melting surface ---------- */
+const DROP_N = 26;
+const dropData = [];
+for (let i = 0; i < DROP_N; i++){
+  dropData.push({
+    dir: randDir(-0.25),
+    size: 0.020 + lcg() * 0.026
+  });
+}
+const dropMat = new THREE.MeshPhysicalMaterial({
+  color: 0xffffff, metalness: 0.0, roughness: 0.03,
+  transparent: true, opacity: 0.72, envMapIntensity: 2.6,
+  clearcoat: 1.0, clearcoatRoughness: 0.01, depthWrite: false
+});
+const dropMesh = new THREE.InstancedMesh(bubbleGeo.clone(), dropMat, DROP_N);
+dropMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+dropMesh.frustumCulled = false;
+dropMesh.renderOrder = 4;
+root.add(dropMesh);
+
+/* ---------- 5.7 dried water ring ---------- */
+const stainGeo = new THREE.TorusGeometry(0.845, 0.007, 6, 110);
+stainGeo.rotateX(-Math.PI/2);
+const stainMat = new THREE.MeshBasicMaterial({
+  color: 0xbfe9ff, transparent: true, opacity: 0.0, depthWrite: false
+});
+const stainMesh = new THREE.Mesh(stainGeo, stainMat);
+stainMesh.position.y = 0.046;
+stainMesh.renderOrder = 1;
+stainMesh.visible = false;
+root.add(stainMesh);
+
+/* =========================================================
+   6. keyframe tables  (everything is a pure function of t)
+   ========================================================= */
+const ICE_KEYS = [
+  { t:-0.93, a:0.10, b:0.012, c:0.10, n:2.0, op:0.32 },
+  { t:-0.72, a:0.36, b:0.028, c:0.36, n:2.3, op:0.36 },
+  { t:-0.50, a:0.66, b:0.060, c:0.66, n:3.0, op:0.42 },
+  { t:-0.32, a:0.68, b:0.280, c:0.68, n:4.2, op:0.46 },
+  { t:-0.14, a:0.64, b:0.560, c:0.64, n:6.2, op:0.50 },
+  { t: 0.00, a:0.62, b:0.600, c:0.62, n:7.6, op:0.50 },
+  { t: 0.18, a:0.59, b:0.550, c:0.59, n:4.6, op:0.46 },
+  { t: 0.34, a:0.56, b:0.460, c:0.56, n:2.7, op:0.40 },
+  { t: 0.55, a:0.36, b:0.260, c:0.36, n:2.2, op:0.34 },
+  { t: 0.72, a:0.20, b:0.140, c:0.20, n:2.0, op:0.26 },
+  { t: 0.86, a:0.02, b:0.015, c:0.02, n:2.0, op:0.10 }
+];
+const ICE_F = ['a','b','c','n','op'];
+
+const WATER_KEYS = [
+  { t:-1.00, r:0.88, op:0.55 },
+  { t:-0.45, r:0.84, op:0.55 },
+  { t:-0.20, r:0.70, op:0.48 },
+  { t: 0.00, r:0.62, op:0.44 },
+  { t: 0.20, r:0.68, op:0.46 },
+  { t: 0.45, r:0.82, op:0.52 },
+  { t: 0.70, r:0.88, op:0.55 },
+  { t: 0.88, r:0.86, op:0.50 },
+  { t: 0.97, r:0.66, op:0.10 },
+  { t: 1.00, r:0.50, op:0.00 }
+];
+const WATER_F = ['r','op'];
+
+const iceP   = { a:0.3, b:0.05, c:0.3, n:2.5, op:0.4 };
+const waterP = { r:0.8, op:0.5 };
+
+function sampleInto(keys, t, out, fields){
+  const n = keys.length;
+  if (t <= keys[0].t){ for (let i=0;i<fields.length;i++) out[fields[i]] = keys[0][fields[i]]; return; }
+  if (t >= keys[n-1].t){ for (let i=0;i<fields.length;i++) out[fields[i]] = keys[n-1][fields[i]]; return; }
+  for (let i=0;i<n-1;i++){
+    const k0 = keys[i], k1 = keys[i+1];
+    if (t >= k0.t && t <= k1.t){
+      const u = sstep(k0.t, k1.t, t);
+      for (let j=0;j<fields.length;j++){ const f = fields[j]; out[f] = mix(k0[f], k1[f], u); }
+      return;
+    }
+  }
+}
+
+/* =========================================================
+   7. per-frame geometry updates (no allocation of GPU objects)
+   ========================================================= */
+const _surf = new THREE.Vector3();
+function surfPoint(dx, dy, dz, a, b, c, n, out){
+  const ex = Math.abs(dx)/a, ey = Math.abs(dy)/b, ez = Math.abs(dz)/c;
+  const s = 1.0 / Math.pow(Math.pow(ex,n) + Math.pow(ey,n) + Math.pow(ez,n), 1.0/n);
+  return out.set(dx*s, dy*s, dz*s);
+}
+
+function updateIceGeometry(a, b, c, n){
+  const pa = icePosAttr.array;
+  const na = iceNormAttr.array;
+  const base = iceBasePos;
+  const invA = 1/a, invB = 1/b, invC = 1/c;
+  const n1 = n - 1.0;
+  for (let i = 0; i < pa.length; i += 3){
+    const dx = base[i], dy = base[i+1], dz = base[i+2];
+    const ex = Math.abs(dx) * invA;
+    const ey = Math.abs(dy) * invB;
+    const ez = Math.abs(dz) * invC;
+    const s = 1.0 / Math.pow(Math.pow(ex,n) + Math.pow(ey,n) + Math.pow(ez,n), 1.0/n);
+
+    const px = dx * s, py = dy * s, pz = dz * s;
+    pa[i] = px; pa[i+1] = py; pa[i+2] = pz;
+
+    let gx = Math.pow(Math.abs(px) * invA, n1) * Math.sign(px) * invA;
+    let gy = Math.pow(Math.abs(py) * invB, n1) * Math.sign(py) * invB;
+    let gz = Math.pow(Math.abs(pz) * invC, n1) * Math.sign(pz) * invC;
+    const l = Math.sqrt(gx*gx + gy*gy + gz*gz) || 1.0;
+    na[i] = gx/l; na[i+1] = gy/l; na[i+2] = gz/l;
+  }
+  icePosAttr.needsUpdate = true;
+  iceNormAttr.needsUpdate = true;
+}
+
+const _dummy = new THREE.Object3D();
+
+/* =========================================================
+   8. apply(t)  — the whole picture is a pure function of t
+   ========================================================= */
+function apply(t){
+  /* ---- whole-object yaw, driven only by t ---- */
+  root.rotation.y = 0.20 + 0.32 * t;
+
+  /* ---- water pool ---- */
+  sampleInto(WATER_KEYS, t, waterP, WATER_F);
+  waterMesh.scale.set(waterP.r, 1, waterP.r);
+  waterMat.opacity = waterP.op;
+  waterMesh.visible = waterP.op > 0.012;
+
+  /* ---- ice body ---- */
+  sampleInto(ICE_KEYS, t, iceP, ICE_F);
+  const iceVisible = (t > -0.94) && (t < 0.87) && (iceP.a > 0.006);
+  iceMesh.visible = iceVisible;
+
+  if (iceVisible){
+    updateIceGeometry(iceP.a, iceP.b, iceP.c, iceP.n);
+    iceMesh.position.y = WATER_Y + iceP.b - 0.015;
+
+    const solid = sstep(0.035, 0.30, iceP.b);
+    iceMat.color.copy(WATER_COL).lerp(ICE_COL, solid);
+    iceMat.opacity = iceP.op;
+    iceMat.roughness = mix(0.02, 0.05, solid);
+  }
+
+  /* ---- radial frost / crystal pattern on the water surface ---- */
+  const fIn  = sstep(-0.94, -0.70, t);
+  const fOut = 1.0 - sstep(-0.42, -0.20, t);
+  const fOp  = fIn * fOut;
+  frostMat.uniforms.uOpacity.value  = fOp * 1.0;
+  frostMat.uniforms.uProgress.value = sstep(-0.94, -0.52, t);
+  frostMesh.scale.setScalar(Math.max(waterP.r * 0.98, 0.02));
+  frostMesh.visible = fOp > 0.006;
+
+  /* ---- bubbles trapped inside the ice ---- */
+  const bubA = sstep(-0.18, 0.02, t) * (1.0 - sstep(0.20, 0.50, t));
+  const bubOn = iceVisible && bubA > 0.02;
+  bubbleMesh.visible = bubOn;
+  if (bubOn){
+    const cy = iceMesh.position.y;
+    for (let i = 0; i < BUBBLE_N; i++){
+      const d = bubbleData[i];
+      surfPoint(d.dir.x, d.dir.y, d.dir.z, iceP.a, iceP.b, iceP.c, iceP.n, _surf);
+      _dummy.position.set(_surf.x * d.k, _surf.y * d.k + cy, _surf.z * d.k);
+      const sc = d.size * bubA;
+      _dummy.scale.set(sc, sc * 1.35, sc);
+      _dummy.rotation.set(0, 0, 0);
+      _dummy.updateMatrix();
+      bubbleMesh.setMatrixAt(i, _dummy.matrix);
+    }
+    bubbleMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  /* ---- droplets clinging to the melting surface ---- */
+  const drA = sstep(0.04, 0.30, t) * (1.0 - sstep(0.58, 0.78, t));
+  const drOn = iceVisible && drA > 0.02;
+  dropMesh.visible = drOn;
+  if (drOn){
+    const cy = iceMesh.position.y;
+    const shrink = clamp(Math.min(iceP.a, iceP.c) * 1.7, 0.25, 1.0);
+    for (let i = 0; i < DROP_N; i++){
+      const d = dropData[i];
+      surfPoint(d.dir.x, d.dir.y, d.dir.z, iceP.a, iceP.b, iceP.c, iceP.n, _surf);
+      const outward = 1.0 + 0.025;
+      _dummy.position.set(_surf.x * outward, _surf.y * outward + cy, _surf.z * outward);
+      const sc = d.size * drA * shrink;
+      _dummy.scale.set(sc, sc * 1.15, sc);
+      _dummy.rotation.set(0, 0, 0);
+      _dummy.updateMatrix();
+      dropMesh.setMatrixAt(i, _dummy.matrix);
+    }
+    dropMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  /* ---- dried water ring at the very end ---- */
+  const sA = sstep(0.86, 1.0, t);
+  stainMat.opacity = sA * 0.5;
+  stainMesh.visible = sA > 0.01;
+}
+
+/* =========================================================
+   9. camera framing  (object centered at 50% / 60%, size <= 0.5*min)
+   ========================================================= */
+const TARGET = new THREE.Vector3(0, 0.58, 0);
+const VIEW_DIR = new THREE.Vector3(0.52, 0.44, 0.73).normalize();
+const BOUND_R = 1.16;
+
+function resize(){
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h);
+
+  const tanHalf = Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5));
+  const m = Math.min(w, h);
+  const frac = EMBED ? 0.44 : 0.48;
+  const d = (BOUND_R * h) / (frac * m * tanHalf);
+
+  camera.position.copy(TARGET).addScaledVector(VIEW_DIR, d);
+  camera.lookAt(TARGET);
+
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+
+  // shift the framing so the object centre lands at 60% of the screen height
+  camera.setViewOffset(w, h, 0, -0.1 * h, w, h);
+  camera.updateProjectionMatrix();
+
+  dirty = true;
+}
+
+/* =========================================================
+   10. render loop
+   ========================================================= */
+let dirty = true;
+let lastNow = 0;
+
+function render(){
+  renderer.render(scene, camera);
+  dirty = false;
+}
+
+function loop(now){
+  requestAnimationFrame(loop);
+  if (lastNow > 0){
+    const dt = now - lastNow;
+    if (dt > 0) fps = fps * 0.9 + (1000 / dt) * 0.1;
+  }
+  lastNow = now;
+  if (dirty) render();
+}
+
+/* =========================================================
+   11. standalone UI
+   ========================================================= */
+let uiStage = null, uiSlider = null;
+
+function nearestStage(t){
+  let best = STAGES[0], bd = Infinity;
+  for (let i = 0; i < STAGES.length; i++){
+    const d = Math.abs(STAGES[i].t - t);
+    if (d < bd){ bd = d; best = STAGES[i]; }
+  }
+  return best;
+}
+
+function syncUI(){
+  if (!uiStage) return;
+  uiStage.textContent = nearestStage(currentT).name;
+  if (uiSlider && Math.abs(parseFloat(uiSlider.value) - currentT) > 0.0005){
+    uiSlider.value = String(currentT);
+  }
+}
+
+function buildUI(){
+  const ui = document.createElement('div');
+  ui.id = 'ui';
+
+  uiStage = document.createElement('div');
+  uiStage.className = 'stage';
+
+  uiSlider = document.createElement('input');
+  uiSlider.type = 'range';
+  uiSlider.min = '-1';
+  uiSlider.max = '1';
+  uiSlider.step = '0.001';
+  uiSlider.value = '0';
+  uiSlider.addEventListener('input', ()=> window.setTime(parseFloat(uiSlider.value)));
+
+  ui.appendChild(uiStage);
+  ui.appendChild(uiSlider);
+  document.body.appendChild(ui);
+
+  window.addEventListener('keydown', e=>{
+    if (e.key === 'ArrowLeft'){ window.setTime(currentT - 0.02); e.preventDefault(); }
+    else if (e.key === 'ArrowRight'){ window.setTime(currentT + 0.02); e.preventDefault(); }
+  });
+
+  syncUI();
+}
+
+/* =========================================================
+   12. boot
+   ========================================================= */
+window.addEventListener('resize', ()=>{ resize(); });
+
+resize();
+apply(currentT);
+ready = true;
+render();
+
+if (!EMBED) buildUI();
+syncUI();
+
+requestAnimationFrame(loop);
+
+/* notify the host once, after everything is initialised */
+window.parent.postMessage({ type:'timespell:stages', stages: window.getStages() }, '*');
+</script>
+</body>
+</html>

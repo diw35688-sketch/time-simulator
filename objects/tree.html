@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<style>html.ts-embed, html.ts-embed body { background: transparent !important; }</style>
+<script>if (new URLSearchParams(location.search).get('embed') === '1') document.documentElement.classList.add('ts-embed');</script>
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>时间模拟器 · 陶盆小树</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#0a0c12; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   0. 接口定义（脚本一开始就就绪）
+   ============================================================ */
+let curT = 0;
+let camT = 0;
+let fpsVal = 0;
+
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+function smoothstep(a, b, x) {
+  const t = clamp((x - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function getStages() {
+  return [
+    { t: -1.00, name: '一颗种子' },
+    { t: -0.72, name: '破土嫩芽' },
+    { t: -0.42, name: '纤细树苗' },
+    { t: -0.14, name: '初生幼树' },
+    { t:  0.00, name: '枝繁叶茂' },
+    { t:  0.26, name: '叶染金黄' },
+    { t:  0.52, name: '层林尽红' },
+    { t:  0.78, name: '落叶归根' },
+    { t:  1.00, name: '冬枝覆雪' }
+  ];
+}
+window.getStages = getStages;
+window.getTime = () => curT;
+window.setTime = (v) => { applyTime(clamp(Number(v) || 0, -1, 1)); };
+window.__timeState = () => ({ t: curT, fps: fpsVal });
+window.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'timespell:setTime') window.setTime(e.data.t);
+});
+
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+
+/* ============================================================
+   1. 渲染器 / 场景 / 相机
+   ============================================================ */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+if (EMBED) {
+  renderer.setClearColor(0x000000, 0);
+  document.documentElement.style.background = 'transparent';
+  document.body.style.background = 'transparent';
+} else {
+  renderer.setClearColor(0x0a0c12, 1);
+}
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+if (!EMBED) scene.background = new THREE.Color(0x0a0c12);
+
+const camera = new THREE.PerspectiveCamera(30, window.innerWidth / window.innerHeight, 0.05, 300);
+
+/* ============================================================
+   2. 三点布光
+   ============================================================ */
+scene.add(new THREE.AmbientLight(0x4a566e, 0.55));
+const hemi = new THREE.HemisphereLight(0x9fb8ff, 0x2a1d13, 0.45);
+scene.add(hemi);
+
+const keyLight = new THREE.DirectionalLight(0xffe6c2, 2.35);
+keyLight.position.set(3.2, 4.6, 3.4);
+scene.add(keyLight);
+
+const fillLight = new THREE.DirectionalLight(0x86b4ff, 0.85);
+fillLight.position.set(-3.8, 1.7, 2.6);
+scene.add(fillLight);
+
+const rimLight = new THREE.DirectionalLight(0xffb27a, 1.75);
+rimLight.position.set(-1.4, 2.8, -4.2);
+scene.add(rimLight);
+
+/* ============================================================
+   3. 程序化纹理
+   ============================================================ */
+function makePotTexture() {
+  const S = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#c4714a';
+  ctx.fillRect(0, 0, S, S);
+  const rnd = mulberry32(4021);
+  // 陶土颗粒
+  for (let i = 0; i < 12000; i++) {
+    const x = rnd() * S, y = rnd() * S;
+    const v = rnd();
+    if (v > 0.55) ctx.fillStyle = `rgba(255,214,180,${0.025 + rnd() * 0.06})`;
+    else ctx.fillStyle = `rgba(60,26,14,${0.025 + rnd() * 0.07})`;
+    const w = 1 + rnd() * 2.2;
+    ctx.fillRect(x, y, w, w * (0.5 + rnd()));
+  }
+  // 拉坯纹
+  for (let y = 0; y < S; y += 5) {
+    const a = 0.012 + rnd() * 0.028;
+    ctx.fillStyle = `rgba(255,220,190,${a})`;
+    ctx.fillRect(0, y, S, 1);
+    ctx.fillStyle = `rgba(70,30,16,${a * 0.9})`;
+    ctx.fillRect(0, y + 2, S, 1);
+  }
+  // 几道深色斑
+  for (let i = 0; i < 26; i++) {
+    const x = rnd() * S, y = rnd() * S, r = 4 + rnd() * 22;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(90,40,20,${0.05 + rnd() * 0.07})`);
+    g.addColorStop(1, 'rgba(90,40,20,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(1, 1);
+  tex.anisotropy = 4;
+  return tex;
+}
+
+function makeSoilTexture() {
+  const S = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#3a2718';
+  ctx.fillRect(0, 0, S, S);
+  const rnd = mulberry32(8823);
+  for (let i = 0; i < 20000; i++) {
+    const x = rnd() * S, y = rnd() * S;
+    const v = rnd();
+    if (v > 0.6) ctx.fillStyle = `rgba(120,88,58,${0.06 + rnd() * 0.16})`;
+    else if (v > 0.25) ctx.fillStyle = `rgba(26,16,9,${0.08 + rnd() * 0.2})`;
+    else ctx.fillStyle = `rgba(160,120,80,${0.05 + rnd() * 0.1})`;
+    const w = 1 + rnd() * 3;
+    ctx.fillRect(x, y, w, w);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+const potTex = makePotTexture();
+const soilTex = makeSoilTexture();
+
+/* ============================================================
+   4. 陶土花盆
+   ============================================================ */
+const ITEM = new THREE.Group();
+scene.add(ITEM);
+
+const potPts = [
+  new THREE.Vector2(0.002, 0.000),
+  new THREE.Vector2(0.098, 0.000),
+  new THREE.Vector2(0.192, 0.003),
+  new THREE.Vector2(0.234, 0.020),
+  new THREE.Vector2(0.263, 0.062),
+  new THREE.Vector2(0.288, 0.162),
+  new THREE.Vector2(0.308, 0.292),
+  new THREE.Vector2(0.328, 0.402),
+  new THREE.Vector2(0.352, 0.450),
+  new THREE.Vector2(0.356, 0.474),
+  new THREE.Vector2(0.342, 0.486),
+  new THREE.Vector2(0.322, 0.472),
+  new THREE.Vector2(0.312, 0.438),
+  new THREE.Vector2(0.300, 0.362)
+];
+const potGeo = new THREE.LatheGeometry(potPts, 44);
+const potMat = new THREE.MeshStandardMaterial({
+  map: potTex, color: 0xffffff, roughness: 0.80, metalness: 0.03,
+  side: THREE.DoubleSide
+});
+const pot = new THREE.Mesh(potGeo, potMat);
+ITEM.add(pot);
+
+/* ============================================================
+   5. 泥土
+   ============================================================ */
+const soilGeo = new THREE.CylinderGeometry(0.296, 0.272, 0.16, 40, 1);
+soilGeo.translate(0, 0.29, 0);
+{
+  const p = soilGeo.attributes.position;
+  const rnd = mulberry32(5150);
+  for (let i = 0; i < p.count; i++) {
+    const y = p.getY(i);
+    if (y > 0.352) {
+      const x = p.getX(i), z = p.getZ(i);
+      const n = Math.sin(x * 19.0 + Math.cos(z * 13.0)) * 0.5
+              + Math.sin(z * 23.0 + Math.cos(x * 11.0)) * 0.5
+              + Math.sin(x * 47.0 + z * 39.0) * 0.28;
+      p.setY(i, 0.368 + n * 0.009);
+    }
+  }
+  soilGeo.computeVertexNormals();
+}
+const soilMat = new THREE.MeshStandardMaterial({
+  map: soilTex, color: 0x9c8a76, roughness: 1.0, metalness: 0.0
+});
+const soil = new THREE.Mesh(soilGeo, soilMat);
+ITEM.add(soil);
+
+/* ============================================================
+   6. 种子
+   ============================================================ */
+const seedGeo = new THREE.SphereGeometry(0.032, 14, 10);
+seedGeo.scale(1.0, 0.62, 1.42);
+const seedMat = new THREE.MeshStandardMaterial({
+  color: 0x6d4a2a, roughness: 0.82, metalness: 0.02, transparent: true, opacity: 1
+});
+const seed = new THREE.Mesh(seedGeo, seedMat);
+seed.position.set(0.052, 0.374, 0.036);
+seed.rotation.set(0.18, 0.95, 0.12);
+ITEM.add(seed);
+
+/* ============================================================
+   7. 树骨架
+   ============================================================ */
+const UP = new THREE.Vector3(0, 1, 0);
+const branchGeo = new THREE.CylinderGeometry(0.6, 1.0, 1.0, 7, 1, false);
+branchGeo.translate(0, 0.5, 0);
+
+const BARK_BROWN = new THREE.Color(0x6b4b33);
+const STEM_GREEN = new THREE.Color(0x5c8f3a);
+const barkMat = new THREE.MeshStandardMaterial({
+  color: 0x6b4b33, roughness: 0.93, metalness: 0.0
+});
+
+const treeBase = new THREE.Group();
+treeBase.position.set(0, 0.350, 0);
+ITEM.add(treeBase);
+
+const branches = [];
+const rngTree = mulberry32(20240917);
+
+function makeBranch(parent, dir, len, rad, birth, dur) {
+  const g = new THREE.Group();
+  parent.add(g);
+  const q = new THREE.Quaternion().setFromUnitVectors(UP, dir.clone().normalize());
+  g.quaternion.copy(q);
+  const mesh = new THREE.Mesh(branchGeo, barkMat);
+  mesh.scale.set(rad, len, rad);
+  g.add(mesh);
+  const tip = new THREE.Object3D();
+  tip.position.y = len;
+  g.add(tip);
+  const rec = { g, mesh, tip, len, rad, birth, dur, depth: 0, snow: null };
+  branches.push(rec);
+  return rec;
+}
+
+const trunk = makeBranch(treeBase, new THREE.Vector3(0.055, 1.0, 0.022), 0.46, 0.038, 0.0, 0.50);
+trunk.depth = -1;
+
+function buildChildren(parentObj, parentLen, parentRad, depth, birthBase) {
+  if (depth > 2) return;
+  const n = depth === 0 ? 3 : (rngTree() < 0.55 ? 3 : 2);
+  for (let i = 0; i < n; i++) {
+    const ang = (i / n) * Math.PI * 2 + rngTree() * 1.15 + depth * 1.9;
+    const spread = 0.44 + rngTree() * 0.48 + depth * 0.09;
+    const dir = new THREE.Vector3(
+      Math.sin(spread) * Math.cos(ang),
+      Math.cos(spread),
+      Math.sin(spread) * Math.sin(ang)
+    ).normalize();
+    const L = parentLen * (0.62 + rngTree() * 0.26);
+    const Rr = parentRad * 0.60;
+    const b = birthBase + rngTree() * 0.10;
+    const rec = makeBranch(parentObj, dir, L, Rr, b, 0.26);
+    rec.depth = depth;
+    buildChildren(rec.tip, L, Rr, depth + 1, b + 0.15);
+  }
+}
+buildChildren(trunk.tip, 0.46, 0.038, 0, 0.38);
+
+/* ============================================================
+   8. 叶片（InstancedMesh）
+   ============================================================ */
+const NLEAF = 620;
+
+const leafGeo = new THREE.PlaneGeometry(0.046, 0.074, 1, 2);
+{
+  const p = leafGeo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i);
+    const ny = y / 0.037;
+    p.setX(i, x * (1.0 - ny * ny * 0.38));
+    p.setZ(i, ny * ny * 0.011);
+  }
+  leafGeo.computeVertexNormals();
+  leafGeo.translate(0, 0.030, 0);
+}
+
+const leafMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 0.70, metalness: 0.0, side: THREE.DoubleSide
+});
+const leafMesh = new THREE.InstancedMesh(leafGeo, leafMat, NLEAF);
+leafMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+leafMesh.frustumCulled = false;
+ITEM.add(leafMesh);
+
+const INIT_COLOR = new THREE.Color(1, 1, 1);
+for (let i = 0; i < NLEAF; i++) leafMesh.setColorAt(i, INIT_COLOR);
+if (leafMesh.instanceColor) leafMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+
+const ONE = new THREE.Vector3(1, 1, 1);
+const leaves = [];
+const leafRng = mulberry32(90210);
+const leafHosts = branches.slice();
+
+for (let i = 0; i < NLEAF; i++) {
+  const host = leafHosts[Math.floor(leafRng() * leafHosts.length)];
+  const off = new THREE.Vector3(
+    (leafRng() - 0.5) * 0.105,
+    (leafRng() - 0.5) * 0.105,
+    (leafRng() - 0.5) * 0.105
+  );
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+    leafRng() * Math.PI * 2, leafRng() * Math.PI * 2, leafRng() * Math.PI * 2
+  ));
+  const base = new THREE.Matrix4().compose(off, q, ONE);
+
+  const scale = 0.55 + leafRng() * 0.78;
+  const birthG = 0.27 + leafRng() * 0.62;
+  const hv = leafRng();
+  const green = new THREE.Color().setHSL(
+    0.238 + hv * 0.055,
+    0.50 + leafRng() * 0.20,
+    0.235 + leafRng() * 0.115
+  );
+
+  const ang = leafRng() * Math.PI * 2;
+  const rad = 0.055 + leafRng() * 0.285;
+  const land = new THREE.Vector3(
+    Math.cos(ang) * rad,
+    0.372 + Math.max(0, rad - 0.245) * 1.15,
+    Math.sin(ang) * rad
+  );
+
+  const dropT = 0.10 + leafRng() * 0.62;
+  const dropDur = 0.19 + leafRng() * 0.13;
+  const offX = (leafRng() - 0.5) * 0.14;
+  const offZ = (leafRng() - 0.5) * 0.14;
+  const phase = leafRng() * 6.2832;
+  const flatQuat = new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(-Math.PI / 2, leafRng() * 6.2832, 0, 'YXZ')
+  );
+
+  leaves.push({
+    tip: host.tip, base, scale, birthG, green, quat: q,
+    land, dropT, dropDur, offX, offZ, phase, flatQuat
+  });
+}
+
+/* ============================================================
+   9. 枝头积雪
+   ============================================================ */
+const snowGeo = new THREE.SphereGeometry(1, 8, 6);
+const snowMat = new THREE.MeshStandardMaterial({
+  color: 0xf4f8ff, roughness: 0.55, metalness: 0.0,
+  emissive: 0x24384f, emissiveIntensity: 0.5,
+  transparent: true, opacity: 0
+});
+const snowMeshes = [];
+for (let i = 0; i < branches.length; i++) {
+  const b = branches[i];
+  if (b.depth < 0) continue;
+  const s = new THREE.Mesh(snowGeo, snowMat);
+  const rr = Math.max(b.rad * 2.0, 0.012);
+  s.scale.set(rr * 1.15, rr * 0.62, rr * 1.15);
+  s.position.set(0, 0, 0);
+  s.visible = false;
+  b.tip.add(s);
+  b.snow = s;
+  snowMeshes.push(s);
+}
+
+/* ============================================================
+   10. 颜色常量
+   ============================================================ */
+const C_YELLOW = new THREE.Color(0xd8b13a);
+const C_RED = new THREE.Color(0xa8341c);
+
+/* ============================================================
+   11. 时间驱动
+   ============================================================ */
+const _lm = new THREE.Matrix4();
+const _lv = new THREE.Vector3();
+const _ls = new THREE.Vector3();
+const _lq = new THREE.Quaternion();
+const _lc = new THREE.Color();
+
+function applyTime(t) {
+  curT = clamp(t, -1, 1);
+  const G = smoothstep(-1.0, -0.02, curT);
+
+  /* ---- 枝干生长 ---- */
+  for (let i = 0; i < branches.length; i++) {
+    const b = branches[i];
+    const f = smoothstep(b.birth, b.birth + b.dur, G);
+    const L = b.len * f;
+    const rs = b.rad * (0.30 + 0.70 * f);
+    b.mesh.scale.set(rs, Math.max(L, 1e-5), rs);
+    b.mesh.visible = f > 0.003;
+    b.tip.position.y = L;
+  }
+
+  /* ---- 树皮：嫩绿茎 → 木质棕 ---- */
+  barkMat.color.copy(STEM_GREEN).lerp(BARK_BROWN, smoothstep(0.55, 0.95, G));
+
+  /* ---- 种子 ---- */
+  const seedA = 1 - smoothstep(0.05, 0.30, G);
+  seedMat.opacity = seedA;
+  seed.visible = seedA > 0.01;
+  seed.scale.setScalar(0.7 + 0.3 * (1 - smoothstep(0.0, 0.4, G)));
+
+  /* ---- 更新世界矩阵（叶片读取需要） ---- */
+  ITEM.updateMatrixWorld(true);
+
+  /* ---- 叶片 ---- */
+  const A1 = smoothstep(0.03, 0.42, curT);
+  const A2 = smoothstep(0.34, 0.70, curT);
+
+  for (let i = 0; i < NLEAF; i++) {
+    const L = leaves[i];
+    const gs = smoothstep(L.birthG, L.birthG + 0.14, G);
+    const sc = Math.max(L.scale * gs, 1e-4);
+
+    // 树上锚点位置
+    _lm.copy(L.base);
+    _lm.scale(_ls.setScalar(sc));
+    _lm.premultiply(L.tip.matrixWorld);
+
+    const ax = _lm.elements[12], ay = _lm.elements[13], az = _lm.elements[14];
+
+    const p = clamp((curT - L.dropT) / L.dropDur, 0, 1);
+
+    if (p > 0) {
+      const p2x = L.land.x, p2y = L.land.y, p2z = L.land.z;
+      const mx = (ax + p2x) * 0.5 + L.offX;
+      const my = (ay + p2y) * 0.5 + 0.115;
+      const mz = (az + p2z) * 0.5 + L.offZ;
+      const sway = Math.sin(p * 13.0 + L.phase) * 0.045 * Math.sin(p * Math.PI);
+      const u = 1 - p;
+      const px = u * u * ax + 2 * u * p * mx + p * p * p2x + sway;
+      const py = u * u * ay + 2 * u * p * my + p * p * p2y;
+      const pz = u * u * az + 2 * u * p * mz + p * p * p2z + sway * 0.6;
+
+      _lq.copy(L.quat).slerp(L.flatQuat, p);
+      _lm.compose(_lv.set(px, py, pz), _lq, _ls.setScalar(L.scale));
+    }
+
+    leafMesh.setMatrixAt(i, _lm);
+
+    _lc.copy(L.green).lerp(C_YELLOW, A1).lerp(C_RED, A2);
+    leafMesh.setColorAt(i, _lc);
+  }
+  leafMesh.instanceMatrix.needsUpdate = true;
+  if (leafMesh.instanceColor) leafMesh.instanceColor.needsUpdate = true;
+
+  /* ---- 积雪 ---- */
+  const snowA = smoothstep(0.84, 1.0, curT);
+  snowMat.opacity = snowA * 0.95;
+  const snowOn = snowA > 0.01;
+  for (let i = 0; i < snowMeshes.length; i++) snowMeshes[i].visible = snowOn;
+
+  /* ---- 相机 ---- */
+  camT = curT;
+  updateCamera();
+}
+
+/* ============================================================
+   12. 相机取景
+   ============================================================ */
+const FOV = 30;
+const TAN_F = Math.tan(THREE.MathUtils.degToRad(FOV) / 2);
+
+function updateCamera() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const minDim = Math.min(w, h);
+  const d = Math.max(4.0, h / (2 * TAN_F * 0.20 * minDim));
+
+  const az = 0.55 + 0.30 * camT;
+  const elev = 0.152;
+  const dropFrac = EMBED ? 0.10 : 0.055;
+  const lookY = 0.76 + dropFrac * 2 * d * TAN_F;
+
+  const horiz = d * Math.cos(elev);
+  camera.position.set(
+    Math.sin(az) * horiz,
+    lookY + d * Math.sin(elev),
+    Math.cos(az) * horiz
+  );
+  camera.lookAt(0, lookY, 0);
+  camera.updateMatrixWorld(true);
+}
+
+/* ============================================================
+   13. 渲染循环
+   ============================================================ */
+let needsRender = true;
+let fpsFrames = 0, fpsLast = 0;
+
+function renderScene() {
+  renderer.render(scene, camera);
+}
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  fpsFrames++;
+  if (now - fpsLast >= 500) {
+    fpsVal = Math.round(fpsFrames * 1000 / (now - fpsLast));
+    fpsFrames = 0;
+    fpsLast = now;
+  }
+  if (needsRender) {
+    needsRender = false;
+    renderScene();
+  }
+}
+
+/* ============================================================
+   14. UI（独立模式）
+   ============================================================ */
+let stageLabel = null, sliderEl = null;
+
+if (!EMBED) {
+  const ui = document.createElement('div');
+  ui.style.cssText = 'position:fixed;left:0;right:0;bottom:0;padding:14px 20px 20px;'
+    + 'display:flex;flex-direction:column;align-items:center;gap:10px;'
+    + 'font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;'
+    + 'pointer-events:none;user-select:none;';
+
+  stageLabel = document.createElement('div');
+  stageLabel.style.cssText = 'font-size:15px;letter-spacing:3px;color:#a9c1da;'
+    + 'text-shadow:0 0 14px rgba(110,170,255,.45);transition:color .2s;';
+
+  sliderEl = document.createElement('input');
+  sliderEl.type = 'range';
+  sliderEl.min = '-1'; sliderEl.max = '1'; sliderEl.step = '0.001'; sliderEl.value = '0';
+  sliderEl.style.cssText = 'width:min(520px,72vw);accent-color:#7fb4ff;pointer-events:auto;cursor:pointer;';
+  sliderEl.addEventListener('input', () => window.setTime(parseFloat(sliderEl.value)));
+
+  ui.appendChild(stageLabel);
+  ui.appendChild(sliderEl);
+  document.body.appendChild(ui);
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); window.setTime(curT - 0.01); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); window.setTime(curT + 0.01); }
+  });
+}
+
+function syncUI() {
+  if (EMBED) return;
+  const stages = getStages();
+  let idx = 0, best = Infinity;
+  for (let i = 0; i < stages.length; i++) {
+    const dd = Math.abs(stages[i].t - curT);
+    if (dd < best) { best = dd; idx = i; }
+  }
+  if (stageLabel) stageLabel.textContent = stages[idx].name;
+  if (sliderEl && Math.abs(parseFloat(sliderEl.value) - curT) > 1e-6) {
+    sliderEl.value = String(curT);
+  }
+}
+
+/* ============================================================
+   15. 启动
+   ============================================================ */
+window.addEventListener('resize', () => {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  updateCamera();
+  needsRender = true;
+});
+
+// 初始状态
+applyTime(0);
+syncUI();
+renderScene();
+updateCamera();
+camera.updateProjectionMatrix();
+renderScene();
+needsRender = false;
+
+requestAnimationFrame(loop);
+
+// 通知宿主阶段列表（唯一一次对外通信）
+try {
+  window.parent.postMessage({ type: 'timespell:stages', stages: getStages() }, '*');
+} catch (e) { /* ignore */ }
+
+// 让 setTime 立即重绘
+const _origSetTime = window.setTime;
+window.setTime = function (v) {
+  _origSetTime(v);
+  syncUI();
+  renderScene();
+  needsRender = false;
+};
+</script>
+</body>
+</html>

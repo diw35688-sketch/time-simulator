@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<style>html.ts-embed, html.ts-embed body { background: transparent !important; }</style>
+<script>if (new URLSearchParams(location.search).get('embed') === '1') document.documentElement.classList.add('ts-embed');</script>
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>时间玫瑰</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#07070c; }
+  body.embed { background: transparent; }
+  canvas { position: fixed; inset: 0; display: block; }
+  #hud {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    width: min(560px, 82vw); display: flex; flex-direction: column; align-items: center;
+    gap: 10px; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    user-select: none; pointer-events: none;
+  }
+  #label {
+    font-size: 14px; letter-spacing: 0.18em; color: #e8c9c0;
+    text-shadow: 0 0 14px rgba(220, 90, 90, 0.55); opacity: 0.92;
+  }
+  #slider {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 3px;
+    background: linear-gradient(90deg, #2c5a2a 0%, #7a2035 50%, #3a3028 100%);
+    border-radius: 2px; outline: none; pointer-events: auto; cursor: pointer;
+  }
+  #slider::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: #f0d9d2; box-shadow: 0 0 12px rgba(255, 140, 120, 0.8); cursor: pointer;
+  }
+  #slider::-moz-range-thumb {
+    width: 14px; height: 14px; border: none; border-radius: 50%;
+    background: #f0d9d2; box-shadow: 0 0 12px rgba(255, 140, 120, 0.8); cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   0. 工具
+   ============================================================ */
+const clamp01 = x => (x < 0 ? 0 : x > 1 ? 1 : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+function ss(a, b, x) { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); }
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(20240617);      // 固定种子，只在初始化阶段使用
+const EMBED = new URLSearchParams(location.search).get('embed') === '1';
+
+/* ============================================================
+   1. 接口（一开始就定义好）
+   ============================================================ */
+const STAGES = [
+  { t: -1.00, name: '土中的种子' },
+  { t: -0.78, name: '破土嫩芽' },
+  { t: -0.45, name: '抽茎含苞' },
+  { t: -0.14, name: '初绽' },
+  { t:  0.00, name: '盛放红玫瑰' },
+  { t:  0.30, name: '花瓣卷曲发黑' },
+  { t:  0.62, name: '花瓣凋落' },
+  { t:  1.00, name: '枯枝残瓣' }
+];
+let T = 0;
+let currentFps = 60;
+
+window.setTime = function (v) {
+  let t = Number(v);
+  if (!isFinite(t)) t = 0;
+  t = Math.max(-1, Math.min(1, t));
+  T = t;
+  applyTime(T);
+  if (!EMBED) { syncHud(); }
+  renderer.render(scene, camera);
+  dirty = false;
+};
+window.getTime = () => T;
+window.getStages = () => STAGES.map(s => ({ t: s.t, name: s.name }));
+window.__timeState = () => ({ t: T, fps: currentFps });
+window.addEventListener('message', e => {
+  if (e.data && e.data.type === 'timespell:setTime') window.setTime(e.data.t);
+});
+
+/* ============================================================
+   2. 渲染器 / 场景 / 相机 / 光照
+   ============================================================ */
+const renderer = new THREE.WebGLRenderer({
+  antialias: true, alpha: EMBED, powerPreference: 'high-performance'
+});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+renderer.setClearColor(EMBED ? 0x000000 : 0x07070c, EMBED ? 0 : 1);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.domElement.style.position = 'fixed';
+renderer.domElement.style.inset = '0';
+renderer.domElement.style.display = 'block';
+if (EMBED) document.body.classList.add('embed');
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 0.05, 120);
+
+/* 背景（仅独立模式） */
+if (!EMBED) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 256;
+  const g2 = cv.getContext('2d');
+  const grd = g2.createRadialGradient(128, 104, 4, 128, 152, 205);
+  grd.addColorStop(0.0, '#20202f');
+  grd.addColorStop(0.42, '#0e0e18');
+  grd.addColorStop(1.0, '#040407');
+  g2.fillStyle = grd;
+  g2.fillRect(0, 0, 256, 256);
+  const bgTex = new THREE.CanvasTexture(cv);
+  bgTex.colorSpace = THREE.SRGBColorSpace;
+  scene.background = bgTex;
+}
+
+/* 光照：三点 + 环境 */
+scene.add(new THREE.AmbientLight(0x54617f, 0.55));
+scene.add(new THREE.HemisphereLight(0x9db0d8, 0x241a12, 0.62));
+
+const keyLight = new THREE.DirectionalLight(0xfff0dc, 2.45);
+keyLight.position.set(4.2, 6.0, 4.4);
+keyLight.castShadow = true;
+keyLight.shadow.mapSize.set(1024, 1024);
+keyLight.shadow.camera.near = 1.0;
+keyLight.shadow.camera.far = 22;
+keyLight.shadow.camera.left = -2.6;
+keyLight.shadow.camera.right = 2.6;
+keyLight.shadow.camera.top = 3.4;
+keyLight.shadow.camera.bottom = -1.8;
+keyLight.shadow.bias = -0.0015;
+keyLight.shadow.normalBias = 0.018;
+keyLight.target.position.set(0, 0.95, 0);
+scene.add(keyLight, keyLight.target);
+
+const fillLight = new THREE.DirectionalLight(0x6f8cff, 0.85);
+fillLight.position.set(-5.0, 2.2, 2.6);
+scene.add(fillLight);
+
+const rimLight = new THREE.DirectionalLight(0xff9a6a, 1.85);
+rimLight.position.set(-1.6, 3.4, -5.6);
+scene.add(rimLight);
+
+/* ============================================================
+   3. 布局（嵌入模式：中心 (50%,60%)，尺寸 0.35*min）
+   ============================================================ */
+const ITEM_CENTER = new THREE.Vector3(0, 0.92, 0);
+const ITEM_SIZE = 2.05;     // 垂直包围尺寸
+
+function layout() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+
+  const minSide = Math.min(w, h);
+  const fitFrac = EMBED ? 0.42 : 0.70;
+  const fracV = EMBED ? fitFrac * minSide / h : fitFrac;
+  const fracH = EMBED ? fitFrac * minSide / w : fitFrac * 1.15;
+
+  const tanHalf = Math.tan(camera.fov * Math.PI / 360);
+  const dV = (ITEM_SIZE / fracV) / (2 * tanHalf);
+  const dH = (1.20 / fracH) / (2 * tanHalf * camera.aspect);
+  const d = Math.max(dV, dH);
+
+  const yaw = 0.40, pitch = 0.13;
+  const dir = new THREE.Vector3(
+    Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)
+  );
+  camera.position.copy(ITEM_CENTER).addScaledVector(dir, d);
+  camera.lookAt(ITEM_CENTER);
+  camera.updateProjectionMatrix();
+
+  if (EMBED) {
+    // 让场景中心渲染在 canvas 的 (50%, 60%) 处
+    camera.setViewOffset(w, h, 0, -0.10 * h, w, h);
+  } else {
+    camera.clearViewOffset();
+  }
+  camera.updateProjectionMatrix();
+  dirty = true;
+}
+let dirty = true;
+
+/* ============================================================
+   4. 伪噪声
+   ============================================================ */
+function noise3(x, y, z) {
+  return Math.sin(x * 1.7 + Math.sin(y * 2.3 + z * 0.7)) * Math.cos(z * 1.9 + Math.sin(x * 1.1)) * 0.6 +
+         Math.sin(x * 4.3 + 1.3) * Math.cos(y * 3.7 + 2.1) * Math.sin(z * 4.9) * 0.4;
+}
+
+/* ============================================================
+   5. 叶片/花瓣几何生成器
+   ============================================================ */
+function makeBlade(o) {
+  const {
+    length = 1, width = 0.3,
+    th0 = 0, th1 = 0.6,
+    cup = 1.0,
+    nu = 14, nv = 9,
+    profile = 'petal',
+    ruffle = 0
+  } = o;
+
+  const ds = length / nu;
+  const cy = new Float32Array(nu + 1);
+  const cz = new Float32Array(nu + 1);
+  const ct = new Float32Array(nu + 1);
+
+  let y = 0, z = 0;
+  for (let i = 0; i <= nu; i++) {
+    const u = i / nu;
+    const th = th0 + (th1 - th0) * Math.pow(u, 1.35);
+    cy[i] = y; cz[i] = z; ct[i] = th;
+    y += Math.cos(th) * ds;
+    z += Math.sin(th) * ds;
+  }
+
+  const vCount = (nu + 1) * (nv + 1);
+  const pos = new Float32Array(vCount * 3);
+  const blade = new Float32Array(vCount * 2);
+  let p = 0, q = 0;
+
+  for (let i = 0; i <= nu; i++) {
+    const u = i / nu;
+    const th = ct[i];
+    const ny = -Math.sin(th);
+    const nz = Math.cos(th);
+
+    let wf;
+    if (profile === 'petal') {
+      wf = Math.pow(Math.sin(Math.PI * Math.pow(u, 0.62)), 0.85);
+    } else {
+      wf = Math.pow(Math.sin(Math.PI * Math.pow(u, 0.45)), 0.70) * (1 - 0.20 * u);
+    }
+    const hw = width * Math.max(wf, 0.008);
+
+    for (let j = 0; j <= nv; j++) {
+      const v = j / nv;
+      const vv = v * 2 - 1;
+      const x = vv * hw;
+      let off = -cup * hw * vv * vv;
+      if (ruffle) off += ruffle * hw * Math.sin(vv * 6.5 + u * 5.0) * u;
+      pos[p++] = x;
+      pos[p++] = cy[i] + ny * off;
+      pos[p++] = cz[i] + nz * off;
+      blade[q++] = u;
+      blade[q++] = v;
+    }
+  }
+
+  const idx = [];
+  for (let i = 0; i < nu; i++) {
+    for (let j = 0; j < nv; j++) {
+      const a = i * (nv + 1) + j;
+      const b = a + nv + 1;
+      idx.push(a, b, a + 1, b, b + 1, a + 1);
+    }
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('aBlade', new THREE.BufferAttribute(blade, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, length * 0.4, 0), length * 1.5 + 0.3);
+  return g;
+}
+
+/* ============================================================
+   6. 叶材质（共享 shader 注入：卷曲 + 变黑/变褐）
+   ============================================================ */
+function bladeOnBeforeCompile(shader) {
+  const U = this.userData.bladeU;
+  shader.uniforms.uWilt = U.uWilt;
+  shader.uniforms.uDark = U.uDark;
+
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <common>',
+    `#include <common>
+     attribute vec2 aBlade;
+     varying vec2 vBlade;
+     uniform float uWilt;`
+  );
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <begin_vertex>',
+    `#include <begin_vertex>
+     vBlade = aBlade;
+     {
+       float e = abs(aBlade.y * 2.0 - 1.0);
+       float tip = aBlade.x;
+       float amt = uWilt * (pow(e, 3.0) * 0.055 + pow(tip, 2.2) * (0.25 + 0.75 * e) * 0.085);
+       transformed += objectNormal * amt;
+     }`
+  );
+
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <common>',
+    `#include <common>
+     varying vec2 vBlade;
+     uniform float uWilt;
+     uniform float uDark;`
+  );
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <color_fragment>',
+    `#include <color_fragment>
+     {
+       float e = abs(vBlade.y * 2.0 - 1.0);
+       float tip = vBlade.x;
+       float edgeF = smoothstep(0.40, 1.0, e);
+       float tipF = smoothstep(0.45, 1.0, tip);
+       float m = clamp(uDark * (edgeF * 0.95 + tipF * 0.95 + 0.08), 0.0, 1.0);
+       vec3 dryCol = vec3(0.115, 0.048, 0.030);
+       diffuseColor.rgb = mix(diffuseColor.rgb, dryCol, m);
+     }`
+  );
+}
+
+function makeBladeMaterial({ color, roughness = 0.6, metalness = 0.0 }) {
+  const m = new THREE.MeshStandardMaterial({
+    color, roughness, metalness, side: THREE.DoubleSide
+  });
+  m.userData.bladeU = { uWilt: { value: 0 }, uDark: { value: 0 } };
+  m.onBeforeCompile = bladeOnBeforeCompile;
+  return m;
+}
+
+/* ============================================================
+   7. 根组
+   ============================================================ */
+const root = new THREE.Group();
+scene.add(root);
+
+/* ---------- 7.1 土块 ---------- */
+const soilGeo = new THREE.SphereGeometry(1, 30, 18, 0, Math.PI * 2, 0, Math.PI * 0.52);
+{
+  const p = soilGeo.attributes.position;
+  const colors = new Float32Array(p.count * 3);
+  for (let i = 0; i < p.count; i++) {
+    const x0 = p.getX(i), y0 = p.getY(i), z0 = p.getZ(i);
+    const n1 = noise3(x0 * 2.6, y0 * 2.6, z0 * 2.6);
+    const n2 = noise3(x0 * 7.2, y0 * 7.2, z0 * 7.2);
+    const rr = 1 + n1 * 0.14 + n2 * 0.055;
+    const yy = Math.sign(y0) * Math.pow(Math.abs(y0), 1.30) * 0.215;
+    p.setXYZ(i, x0 * rr * 0.47, yy + n2 * 0.018, z0 * rr * 0.47);
+    const shade = 0.82 + n1 * 0.26 + n2 * 0.13;
+    colors[i * 3]     = 0.345 * shade;
+    colors[i * 3 + 1] = 0.235 * shade;
+    colors[i * 3 + 2] = 0.158 * shade;
+  }
+  soilGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  soilGeo.computeVertexNormals();
+  soilGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0.08, 0), 0.75);
+}
+const soilMat = new THREE.MeshStandardMaterial({
+  vertexColors: true, roughness: 0.96, metalness: 0.0
+});
+const soilMesh = new THREE.Mesh(soilGeo, soilMat);
+soilMesh.receiveShadow = true;
+root.add(soilMesh);
+
+/* 小碎石 */
+const pebbleGeo = new THREE.IcosahedronGeometry(0.035, 0);
+const pebbleMat = new THREE.MeshStandardMaterial({ color: 0x6a5a4a, roughness: 0.85, metalness: 0.05 });
+for (let i = 0; i < 6; i++) {
+  const m = new THREE.Mesh(pebbleGeo, pebbleMat);
+  const a = rnd() * Math.PI * 2;
+  const r = 0.20 + rnd() * 0.20;
+  m.position.set(Math.cos(a) * r, 0.145 + rnd() * 0.03, Math.sin(a) * r);
+  m.scale.set(0.7 + rnd() * 0.9, 0.5 + rnd() * 0.5, 0.7 + rnd() * 0.9);
+  m.rotation.set(rnd() * 3, rnd() * 3, rnd() * 3);
+  m.castShadow = true; m.receiveShadow = true;
+  root.add(m);
+}
+
+/* ---------- 7.2 种子 ---------- */
+const seedGeo = new THREE.SphereGeometry(1, 14, 10);
+seedGeo.scale(0.050, 0.032, 0.038);
+const seedMat = new THREE.MeshStandardMaterial({ color: 0x6d4d2e, roughness: 0.55, metalness: 0.08 });
+const seedMesh = new THREE.Mesh(seedGeo, seedMat);
+seedMesh.position.set(0.012, 0.183, 0.006);
+seedMesh.rotation.set(0.25, 0.6, 0.15);
+seedMesh.castShadow = true;
+root.add(seedMesh);
+
+/* ---------- 7.3 子叶（两片小嫩叶） ---------- */
+const cotyGeo = makeBlade({
+  length: 0.155, width: 0.062, th0: -0.20, th1: 0.55,
+  cup: 0.75, nu: 10, nv: 6, profile: 'leaf', ruffle: 0.04
+});
+const cotyMat = makeBladeMaterial({ color: 0x86c94e, roughness: 0.55 });
+const cotyGroup = new THREE.Group();
+cotyGroup.position.set(0, 0.075, 0);
+root.add(cotyGroup);
+const cotyList = [];
+for (let i = 0; i < 2; i++) {
+  const m = new THREE.Mesh(cotyGeo, cotyMat);
+  m.rotation.order = 'YXZ';
+  m.rotation.y = i * Math.PI + 0.35;
+  m.rotation.x = -Math.PI / 2 + 0.62;
+  m.castShadow = true;
+  cotyGroup.add(m);
+  cotyList.push(m);
+}
+
+/* ---------- 7.4 动态茎 ---------- */
+const STEM_BASE_Y = 0.02;
+const STEM_MAX_LEN = 1.42;
+const STEM_SAMPLES = 40;
+
+const stemState = {
+  length: 0, phi0: 0.02, phiK: 0.22, azimuth: 0.72, sway: 0.0, radius: 0.026
+};
+const stemPts = new Float32Array((STEM_SAMPLES + 1) * 3);
+const stemTop = new THREE.Vector3();
+const stemTopDir = new THREE.Vector3(0, 1, 0);
+
+function stemPointAt(s, out) {
+  const f = clamp01(s) * STEM_SAMPLES;
+  const i = Math.min(STEM_SAMPLES - 1, Math.floor(f));
+  const fr = f - i;
+  const a = i * 3, b = (i + 1) * 3;
+  out.set(
+    stemPts[a]     + (stemPts[b]     - stemPts[a])     * fr,
+    stemPts[a + 1] + (stemPts[b + 1] - stemPts[a + 1]) * fr,
+    stemPts[a + 2] + (stemPts[b + 2] - stemPts[a + 2]) * fr
+  );
+  return out;
+}
+
+class DynTube {
+  constructor(radialSeg, tubularSeg) {
+    this.radialSeg = radialSeg;
+    this.tubularSeg = tubularSeg;
+    const vCount = (radialSeg + 1) * (tubularSeg + 1);
+    this.positions = new Float32Array(vCount * 3);
+    this.normals = new Float32Array(vCount * 3);
+    const uvs = new Float32Array(vCount * 2);
+    const idx = [];
+    for (let j = 0; j < tubularSeg; j++) {
+      for (let i = 0; i < radialSeg; i++) {
+        const a = j * (radialSeg + 1) + i;
+        const b = (j + 1) * (radialSeg + 1) + i;
+        idx.push(a, b, a + 1, b, b + 1, a + 1);
+      }
+    }
+    for (let j = 0; j <= tubularSeg; j++) {
+      for (let i = 0; i <= radialSeg; i++) {
+        const k = j * (radialSeg + 1) + i;
+        uvs[k * 2] = i / radialSeg;
+        uvs[k * 2 + 1] = j / tubularSeg;
+      }
+    }
+    this.geo = new THREE.BufferGeometry();
+    this.geo.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
+    this.geo.setAttribute('normal', new THREE.BufferAttribute(this.normals, 3));
+    this.geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    this.geo.setIndex(idx);
+    this.geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0.8, 0), 2.2);
+
+    this._p = new THREE.Vector3();
+    this._a = new THREE.Vector3();
+    this._b = new THREE.Vector3();
+    this._t = new THREE.Vector3();
+    this._n = new THREE.Vector3();
+    this._bn = new THREE.Vector3();
+  }
+
+  update(fnCenter, fnRadius) {
+    const RS = this.radialSeg, TS = this.tubularSeg;
+    const pos = this.positions, nor = this.normals;
+    const P = this._p, A = this._a, B = this._b;
+    const Tg = this._t, Nn = this._n, Bn = this._bn;
+    const du = 0.025;
+    let pi = 0, ni = 0;
+
+    for (let j = 0; j <= TS; j++) {
+      const s = j / TS;
+      fnCenter(s, P);
+      fnCenter(Math.min(1, s + du), A);
+      fnCenter(Math.max(0, s - du), B);
+      Tg.subVectors(A, B);
+      if (Tg.lengthSq() < 1e-9) Tg.set(0, 1, 0); else Tg.normalize();
+      Nn.set(1, 0, 0).cross(Tg);
+      if (Nn.lengthSq() < 1e-9) Nn.set(0, 0, 1); else Nn.normalize();
+      Bn.crossVectors(Tg, Nn).normalize();
+
+      const r = fnRadius(s);
+      for (let i = 0; i <= RS; i++) {
+        const ang = (i / RS) * Math.PI * 2;
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+        const nx = Nn.x * ca + Bn.x * sa;
+        const ny = Nn.y * ca + Bn.y * sa;
+        const nz = Nn.z * ca + Bn.z * sa;
+        pos[pi++] = P.x + nx * r;
+        pos[pi++] = P.y + ny * r;
+        pos[pi++] = P.z + nz * r;
+        nor[ni++] = nx;
+        nor[ni++] = ny;
+        nor[ni++] = nz;
+      }
+    }
+    this.geo.attributes.position.needsUpdate = true;
+    this.geo.attributes.normal.needsUpdate = true;
+  }
+}
+
+const stemTube = new DynTube(8, 26);
+const stemMat = new THREE.MeshStandardMaterial({ color: 0x3f7a30, roughness: 0.66, metalness: 0.04 });
+const stemMesh = new THREE.Mesh(stemTube.geo, stemMat);
+stemMesh.castShadow = true;
+stemMesh.frustumCulled = false;
+root.add(stemMesh);
+
+function stemCenterFn(s, out) {
+  return stemPointAt(s, out);
+}
+function stemRadiusFn(s) {
+  return stemState.radius * (1.0 - 0.22 * s);
+}
+
+/* ---------- 7.5 刺 ---------- */
+const thornGeo = new THREE.ConeGeometry(0.0145, 0.055, 5);
+thornGeo.translate(0, 0.0275, 0);
+const thornMat = new THREE.MeshStandardMaterial({ color: 0x4a6b2e, roughness: 0.7, metalness: 0.05 });
+const thornList = [];
+for (let i = 0; i < 7; i++) {
+  const m = new THREE.Mesh(thornGeo, thornMat);
+  m.castShadow = false;
+  root.add(m);
+  thornList.push({ mesh: m, s: 0.20 + (i / 7) * 0.66, ang: i * 2.35 + rnd() * 0.7 });
+}
+
+/* ---------- 7.6 叶子 ---------- */
+const leafGeo = makeBlade({
+  length: 0.44, width: 0.175, th0: 0.60, th1: -0.42,
+  cup: 0.85, nu: 16, nv: 9, profile: 'leaf', ruffle: 0.05
+});
+const leafMat = makeBladeMaterial({ color: 0x39702c, roughness: 0.62 });
+const leafList = [];
+const LEAF_DEF = [{ s: 0.34, az: 0.55 }, { s: 0.57, az: 3.62 }];
+for (let i = 0; i < LEAF_DEF.length; i++) {
+  const m = new THREE.Mesh(leafGeo, leafMat);
+  m.rotation.order = 'YXZ';
+  m.rotation.y = LEAF_DEF[i].az;
+  m.rotation.x = -Math.PI / 2 + 0.12;
+  m.castShadow = true;
+  m.visible = false;
+  root.add(m);
+  leafList.push({ mesh: m, s: LEAF_DEF[i].s });
+}
+
+/* ---------- 7.7 花头 ---------- */
+const flower = new THREE.Group();
+root.add(flower);
+
+/* 花瓣几何（三层） */
+const petalGeoIn = makeBlade({
+  length: 0.27, width: 0.105, th0: -0.08, th1: -0.52,
+  cup: 1.55, nu: 12, nv: 8, profile: 'petal', ruffle: 0.035
+});
+const petalGeoMid = makeBlade({
+  length: 0.35, width: 0.150, th0: -0.10, th1: -0.66,
+  cup: 1.30, nu: 14, nv: 8, profile: 'petal', ruffle: 0.040
+});
+const petalGeoOut = makeBlade({
+  length: 0.42, width: 0.180, th0: -0.12, th1: -0.80,
+  cup: 1.05, nu: 16, nv: 9, profile: 'petal', ruffle: 0.045
+});
+
+const petalMatIn  = makeBladeMaterial({ color: 0xa81d31, roughness: 0.58 });
+const petalMatMid = makeBladeMaterial({ color: 0xc22339, roughness: 0.55 });
+const petalMatOut = makeBladeMaterial({ color: 0xd42b40, roughness: 0.52 });
+
+const PETAL_CFG = [
+  { count: 4, geo: petalGeoIn,  mat: petalMatIn,  tiltC: 0.05, tiltO: 0.30, azOff: 0.00, yOff:  0.022, delay: 0.22, sMin: 0.30 },
+  { count: 5, geo: petalGeoMid, mat: petalMatMid, tiltC: 0.07, tiltO: 0.66, azOff: 0.62, yOff:  0.000, delay: 0.10, sMin: 0.32 },
+  { count: 7, geo: petalGeoOut, mat: petalMatOut, tiltC: 0.09, tiltO: 1.06, azOff: 0.26, yOff: -0.026, delay: 0.00, sMin: 0.34 }
+];
+
+const petals = [];
+for (let L = 0; L < 3; L++) {
+  const cfg = PETAL_CFG[L];
+  for (let i = 0; i < cfg.count; i++) {
+    const mesh = new THREE.Mesh(cfg.geo, cfg.mat);
+    mesh.rotation.order = 'YXZ';
+    mesh.castShadow = true;
+    mesh.position.y = cfg.yOff;
+    const az = (i / cfg.count) * Math.PI * 2 + cfg.azOff + (rnd() - 0.5) * 0.28;
+    const jit = 1 + (rnd() - 0.5) * 0.18;
+    flower.add(mesh);
+    petals.push({ mesh, cfg, az, jit });
+  }
+}
+
+/* 绿色花苞外壳 */
+const budProfile = [];
+for (let i = 0; i <= 14; i++) {
+  const u = i / 14;
+  const r = 0.108 * Math.sin(Math.PI * Math.pow(u, 0.68)) * (1 - 0.22 * u) + 0.005;
+  budProfile.push(new THREE.Vector2(r, -0.02 + u * 0.40));
+}
+const budGeo = new THREE.LatheGeometry(budProfile, 16);
+const budMat = new THREE.MeshStandardMaterial({
+  color: 0x4d7a34, roughness: 0.78, metalness: 0.02, side: THREE.DoubleSide
+});
+const budMesh = new THREE.Mesh(budGeo, budMat);
+budMesh.castShadow = true;
+flower.add(budMesh);
+
+/* 萼片 */
+const sepalGeo = makeBlade({
+  length: 0.30, width: 0.070, th0: 0.05, th1: 0.62,
+  cup: 0.60, nu: 10, nv: 6, profile: 'leaf', ruffle: 0.03
+});
+const sepalMat = makeBladeMaterial({ color: 0x3c6b2a, roughness: 0.72 });
+const sepals = [];
+for (let i = 0; i < 5; i++) {
+  const m = new THREE.Mesh(sepalGeo, sepalMat);
+  m.rotation.order = 'YXZ';
+  m.castShadow = true;
+  m.position.y = -0.012;
+  const az = (i / 5) * Math.PI * 2 + 0.35 + (rnd() - 0.5) * 0.2;
+  flower.add(m);
+  sepals.push({ mesh: m, az, jit: 1 + (rnd() - 0.5) * 0.14 });
+}
+
+/* 花托 */
+const recGeo = new THREE.SphereGeometry(0.062, 14, 10);
+recGeo.scale(1.0, 0.82, 1.0);
+recGeo.translate(0, -0.030, 0);
+const recMat = new THREE.MeshStandardMaterial({ color: 0x3f6f2c, roughness: 0.72 });
+const recMesh = new THREE.Mesh(recGeo, recMat);
+recMesh.castShadow = true;
+flower.add(recMesh);
+
+/* ---------- 7.8 落瓣 ---------- */
+const fallenList = [];
+const FP_COUNT = 9;
+for (let i = 0; i < FP_COUNT; i++) {
+  const mesh = new THREE.Mesh(petalGeoOut, petalMatOut);
+  mesh.rotation.order = 'YXZ';
+  mesh.castShadow = false;
+  mesh.visible = false;
+  root.add(mesh);
+
+  const ang = rnd() * Math.PI * 2;
+  const rad = 0.11 + rnd() * 0.27;
+  const endPos = new THREE.Vector3(
+    Math.cos(ang) * rad,
+    0.150 + rnd() * 0.028,
+    Math.sin(ang) * rad
+  );
+  const startPos = new THREE.Vector3(
+    (rnd() - 0.5) * 0.22,
+    1.42 + rnd() * 0.24,
+    (rnd() - 0.5) * 0.22
+  );
+  const t0 = 0.36 + (i / FP_COUNT) * 0.30 + rnd() * 0.07;
+  const seedR = rnd();
+  fallenList.push({
+    mesh, startPos, endPos, t0,
+    r0: new THREE.Vector3(
+      -0.15 + rnd() * 0.5,
+      seedR * Math.PI * 2,
+      (rnd() - 0.5) * 0.6
+    ),
+    r1: new THREE.Vector3(
+      -Math.PI / 2 + (rnd() - 0.5) * 0.55,
+      seedR * Math.PI * 2 + Math.PI * (0.5 + rnd()),
+      (rnd() - 0.5) * 0.5
+    )
+  });
+}
+
+/* ============================================================
+   8. 时间驱动
+   ============================================================ */
+const _cA = new THREE.Color();
+const _cB = new THREE.Color();
+
+const COL_STEM_GREEN = 0x3f7a30;
+const COL_STEM_YELLOW = 0x8d8434;
+const COL_STEM_BROWN = 0x5b4327;
+
+const _v1 = new THREE.Vector3();
+const _v2 = new THREE.Vector3();
+const _v3 = new THREE.Vector3();
+const _n1 = new THREE.Vector3();
+const _n2 = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const _up = new THREE.Vector3(0, 1, 0);
+
+function applyTime(t) {
+  /* ---------- 主时间曲线 ---------- */
+  const grow  = 0.05 * ss(-0.86, -0.78, t) + 0.42 * ss(-0.82, -0.40, t) + 0.53 * ss(-0.46, -0.12, t);
+  const bloom = ss(-0.22, 0.05, t);
+  const wilt  = ss(0.10, 0.60, t);
+  const fall  = ss(0.34, 0.86, t);
+  const dry   = ss(0.60, 1.00, t);
+
+  /* ---------- 整体朝向（只由 t 决定） ---------- */
+  root.rotation.y = 0.42 + 0.38 * t;
+
+  /* ---------- 种子 ---------- */
+  const seedVis = 1 - ss(-0.80, -0.66, t);
+  if (seedVis > 0.02) {
+    seedMesh.visible = true;
+    const sc = 0.35 + 0.65 * seedVis;
+    seedMesh.scale.setScalar(sc);
+    seedMesh.position.y = 0.183 - (1 - seedVis) * 0.17;
+  } else {
+    seedMesh.visible = false;
+  }
+
+  /* ---------- 子叶 ---------- */
+  const cotyP = ss(-0.82, -0.68, t) * (1 - ss(-0.52, -0.36, t));
+  if (cotyP > 0.02) {
+    cotyGroup.visible = true;
+    const s = 0.15 + 0.85 * cotyP;
+    cotyList.forEach((m, i) => {
+      m.scale.setScalar(s);
+      m.rotation.y = i * Math.PI + 0.35 + t * 0.15;
+    });
+  } else {
+    cotyGroup.visible = false;
+  }
+
+  /* ---------- 茎 ---------- */
+  const len = STEM_MAX_LEN * grow;
+  stemState.length = len;
+  stemState.phi0 = 0.015 + dry * 0.20;
+  stemState.phiK = 0.20 + dry * 0.95;
+  stemState.azimuth = 0.72 + t * 0.10;
+  stemState.radius = 0.027 * (0.34 + 0.66 * Math.min(1, grow * 1.7)) * (1 - 0.30 * dry);
+
+  if (len > 0.012) {
+    stemMesh.visible = true;
+    // 重建中心点
+    const N = STEM_SAMPLES;
+    const ds = len / N;
+    let x = 0, y = STEM_BASE_Y, z = 0;
+    for (let i = 0; i <= N; i++) {
+      const s = i / N;
+      stemPts[i * 3] = x;
+      stemPts[i * 3 + 1] = y;
+      stemPts[i * 3 + 2] = z;
+      const phi = stemState.phi0 + stemState.phiK * s * s;
+      const az = stemState.azimuth;
+      x += Math.sin(phi) * Math.cos(az) * ds;
+      y += Math.cos(phi) * ds;
+      z += Math.sin(phi) * Math.sin(az) * ds;
+    }
+    stemTop.set(stemPts[N * 3], stemPts[N * 3 + 1], stemPts[N * 3 + 2]);
+    stemTopDir.set(
+      stemPts[N * 3] - stemPts[(N - 1) * 3],
+      stemPts[N * 3 + 1] - stemPts[(N - 1) * 3 + 1],
+      stemPts[N * 3 + 2] - stemPts[(N - 1) * 3 + 2]
+    ).normalize();
+
+    stemTube.update(stemCenterFn, stemRadiusFn);
+
+    // 颜色：绿 → 黄绿 → 褐
+    _cA.setHex(COL_STEM_GREEN).lerp(_cB.setHex(COL_STEM_YELLOW), wilt * 0.72);
+    _cA.lerp(_cB.setHex(COL_STEM_BROWN), dry);
+    stemMat.color.copy(_cA);
+    thornMat.color.copy(_cA).multiplyScalar(0.85);
+  } else {
+    stemMesh.visible = false;
+    stemTop.set(0, STEM_BASE_Y, 0);
+    stemTopDir.set(0, 1, 0);
+  }
+
+  /* ---------- 刺 ---------- */
+  const thornVisible = len > 0.22;
+  thornList.forEach(th => {
+    th.mesh.visible = thornVisible;
+    if (!thornVisible) return;
+    const s = th.s;
+    stemPointAt(s, _v1);
+    stemPointAt(Math.min(1, s + 0.03), _v2);
+    stemPointAt(Math.max(0, s - 0.03), _v3);
+    _v2.sub(_v3);
+    if (_v2.lengthSq() < 1e-9) _v2.set(0, 1, 0); else _v2.normalize();
+    _n1.set(1, 0, 0).cross(_v2);
+    if (_n1.lengthSq() < 1e-9) _n1.set(0, 0, 1); else _n1.normalize();
+    _n2.crossVectors(_v2, _n1).normalize();
+    const ca = Math.cos(th.ang), sa = Math.sin(th.ang);
+    _dir.copy(_n1).multiplyScalar(ca).addScaledVector(_n2, sa);
+    _dir.y -= 0.42;
+    _dir.normalize();
+    th.mesh.position.copy(_v1);
+    _q.setFromUnitVectors(_up, _dir);
+    th.mesh.quaternion.copy(_q);
+    th.mesh.scale.setScalar(0.75 + 0.35 * Math.min(1, grow * 1.6));
+  });
+
+  /* ---------- 叶子 ---------- */
+  const leafP = clamp01((grow - 0.26) / 0.44);
+  leafList.forEach(L => {
+    if (leafP < 0.03) { L.mesh.visible = false; return; }
+    L.mesh.visible = true;
+    stemPointAt(L.s, _v1);
+    L.mesh.position.copy(_v1);
+    L.mesh.rotation.y = LEAF_DEF[leafList.indexOf(L)].az + t * 0.06;
+    L.mesh.rotation.x = -Math.PI / 2 + 0.12 - dry * 0.55;
+    const sc = leafP * (1 - 0.42 * dry);
+    L.mesh.scale.setScalar(Math.max(0.001, sc));
+  });
+  leafMat.userData.bladeU.uWilt.value = Math.min(1, wilt * 0.6 + dry * 0.9);
+  leafMat.userData.bladeU.uDark.value = Math.min(1, wilt * 0.55 + dry * 1.0);
+
+  /* ---------- 花头定位 ---------- */
+  flower.position.copy(stemTop);
+  if (len > 0.05) {
+    _q.setFromUnitVectors(_up, stemTopDir);
+    flower.quaternion.copy(_q);
+  } else {
+    flower.quaternion.identity();
+  }
+
+  /* ---------- 绿苞外壳 ---------- */
+  const budP = 1 - ss(0.02, 0.62, bloom);
+  if (budP > 0.02) {
+    budMesh.visible = true;
+    budMesh.scale.setScalar(Math.max(0.02, 0.35 + 0.65 * budP));
+    budMat.color.setHex(0x4d7a34).lerp(_cB.setHex(0x6b5a2a), dry * 0.85);
+  } else {
+    budMesh.visible = false;
+  }
+
+  /* ---------- 花瓣 ---------- */
+  for (let i = 0; i < petals.length; i++) {
+    const p = petals[i];
+    const cfg = p.cfg;
+    const bl = clamp01((bloom - cfg.delay) / Math.max(0.001, 1 - cfg.delay));
+    const ease = bl * bl * (3 - 2 * bl);
+    const tilt = lerp(cfg.tiltC, cfg.tiltO, ease) + dry * 0.16;
+    p.mesh.rotation.x = tilt;
+    p.mesh.rotation.y = p.az + t * 0.05;
+    const growP = lerp(cfg.sMin, 1.0, ease) * p.jit * (1 - 0.18 * dry);
+    p.mesh.scale.setScalar(Math.max(0.001, growP));
+
+    // 花瓣掉落：整体淡出（缩小）后隐藏
+    const dropStart = 0.40 + (i % 7) * 0.032;
+    const dropped = ss(dropStart, dropStart + 0.20, t);
+    const finalScale = growP * (1 - dropped);
+    if (finalScale < 0.012) {
+      p.mesh.visible = false;
+    } else {
+      p.mesh.visible = true;
+      p.mesh.scale.setScalar(finalScale);
+    }
+  }
+
+  const petalWilt = Math.min(1, wilt * (1 - fall * 0.35));
+  const petalDark = Math.min(1, wilt * 0.45 + fall * 0.72 + dry * 0.25);
+  petalMatIn.userData.bladeU.uWilt.value = petalWilt;
+  petalMatIn.userData.bladeU.uDark.value = petalDark;
+  petalMatMid.userData.bladeU.uWilt.value = petalWilt;
+  petalMatMid.userData.bladeU.uDark.value = petalDark;
+  petalMatOut.userData.bladeU.uWilt.value = petalWilt;
+  petalMatOut.userData.bladeU.uDark.value = petalDark;
+
+  /* ---------- 萼片 ---------- */
+  const sepalTilt = lerp(0.06, 1.62, ss(0.0, 0.75, bloom)) + dry * 0.12;
+  sepals.forEach((sp, i) => {
+    sp.mesh.rotation.x = sepalTilt;
+    sp.mesh.rotation.y = sp.az + t * 0.05;
+    sp.mesh.scale.setScalar(sp.jit * (0.6 + 0.4 * clamp01(grow * 2.0)) * (1 - 0.18 * dry));
+    sp.mesh.visible = grow > 0.30;
+  });
+  sepalMat.userData.bladeU.uWilt.value = Math.min(1, wilt * 0.7 + dry * 0.6);
+  sepalMat.userData.bladeU.uDark.value = Math.min(1, wilt * 0.5 + dry * 1.0);
+
+  /* ---------- 花托 ---------- */
+  recMesh.visible = grow > 0.30;
+  recMat.color.setHex(0x3f6f2c).lerp(_cB.setHex(0x5c4325), dry);
+
+  /* ---------- 落瓣 ---------- */
+  for (let i = 0; i < fallenList.length; i++) {
+    const fp = fallenList[i];
+    const p = clamp01((t - fp.t0) / 0.20);
+    if (p <= 0.001) { fp.mesh.visible = false; continue; }
+    fp.mesh.visible = true;
+    const e = p * p * (3 - 2 * p);
+    fp.mesh.position.lerpVectors(fp.startPos, fp.endPos, e);
+    fp.mesh.position.y += Math.sin(p * Math.PI) * 0.10;
+    fp.mesh.rotation.set(
+      lerp(fp.r0.x, fp.r1.x, e),
+      lerp(fp.r0.y, fp.r1.y, e),
+      lerp(fp.r0.z, fp.r1.z, e)
+    );
+    const sc = 0.30 + 0.70 * e;
+    fp.mesh.scale.setScalar(sc);
+  }
+}
+
+/* ============================================================
+   9. 独立模式 UI
+   ============================================================ */
+let hudLabel = null, hudSlider = null;
+if (!EMBED) {
+  const hud = document.createElement('div');
+  hud.id = 'hud';
+  hudLabel = document.createElement('div');
+  hudLabel.id = 'label';
+  hudSlider = document.createElement('input');
+  hudSlider.id = 'slider';
+  hudSlider.type = 'range';
+  hudSlider.min = '-1';
+  hudSlider.max = '1';
+  hudSlider.step = '0.001';
+  hudSlider.value = '0';
+  hud.appendChild(hudLabel);
+  hud.appendChild(hudSlider);
+  document.body.appendChild(hud);
+
+  hudSlider.addEventListener('input', () => {
+    window.setTime(parseFloat(hudSlider.value));
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); window.setTime(T - 0.02); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); window.setTime(T + 0.02); }
+  });
+}
+
+function stageNameAt(t) {
+  let name = STAGES[0].name;
+  for (let i = 0; i < STAGES.length; i++) {
+    if (t >= STAGES[i].t - 1e-6) name = STAGES[i].name;
+  }
+  return name;
+}
+function syncHud() {
+  if (!hudSlider) return;
+  hudSlider.value = String(T);
+  hudLabel.textContent = stageNameAt(T);
+}
+
+/* ============================================================
+   10. 循环与启动
+   ============================================================ */
+let frames = 0;
+let fpsTimer = 0;
+function tick(now) {
+  requestAnimationFrame(tick);
+  frames++;
+  if (fpsTimer === 0) fpsTimer = now;
+  if (now - fpsTimer > 500) {
+    currentFps = Math.round(frames * 1000 / (now - fpsTimer));
+    frames = 0;
+    fpsTimer = now;
+  }
+  if (dirty) {
+    renderer.render(scene, camera);
+    dirty = false;
+  }
+}
+
+window.addEventListener('resize', layout);
+
+layout();
+window.setTime(0);
+syncHud();
+requestAnimationFrame(tick);
+
+/* 通知宿主阶段列表（只执行一次） */
+try {
+  window.parent.postMessage({ type: 'timespell:stages', stages: window.getStages() }, '*');
+} catch (err) { /* 忽略 */ }
+</script>
+</body>
+</html>
