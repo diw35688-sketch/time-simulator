@@ -12,7 +12,7 @@ async def main():
         pg = await ctx.new_page()
         errs, missing = [], []
         pg.on('pageerror', lambda e: errs.append(str(e)[:200]))
-        pg.on('console', lambda m: m.type == 'error' and not m.text.startswith('Failed to load resource') and errs.append(m.text[:200]))
+        pg.on('console', lambda m: m.type == 'error' and not m.text.startswith(('Failed to load resource', 'INFO:')) and errs.append(m.text[:200]))
         pg.on('response', lambda r: r.status >= 400 and not r.url.endswith('/api/objects') and missing.append(r.url))   # 没开 server.py 时 api 404 是正常的
         await pg.goto(f'{BASE}/index.html')
         status = ''
@@ -27,7 +27,7 @@ async def main():
                 break
             await pg.wait_for_timeout(1000)
         v = await pg.evaluate("(() => { const v = document.getElementById('cam'); return { w: v.videoWidth, h: v.videoHeight, playing: !v.paused } })()")
-        print(json.dumps({'handStatus': status, 'arm_model': '手臂' in status, 'video': v,
+        print(json.dumps({'handStatus': status, 'arm_model': '手臂' in status, 'video': v, 'detector': (await pg.evaluate('window.__timespell().detector')),
                           'banner': await pg.evaluate("document.getElementById('banner').textContent"), 'not_found': missing, 'errors': errs}, ensure_ascii=False, indent=1))
         await b.close()
 

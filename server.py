@@ -16,7 +16,7 @@ BUILTIN_INDEX = ROOT / 'objects' / 'index.json'   # 内置物品清单，贡献�
 PUBLIC = os.environ.get('TIMESPELL_PUBLIC') == '1'
 # 只对外提供这些文件和目录，其它文件（.env、.git 等）一律 404
 STATIC_FILES = ('index.html', 'studio.js')
-STATIC_DIRS = ('objects/', 'prompts/', 'assets/', 'vendor/', 'docs/')
+STATIC_DIRS = ('js/', 'objects/', 'prompts/', 'assets/', 'vendor/', 'docs/')
 # 物品跑在沙箱 iframe（不透明源）里，加载 three.js 和贴图要跨源许可；接口响应不给，别的网站读不到
 CORS_DIRS = ('vendor/', 'assets/', 'objects/')
 DEFAULT_HOSTS = ('api.deepseek.com', 'api-inference.modelscope.cn', 'dashscope.aliyuncs.com', 'api.siliconflow.cn',
@@ -51,6 +51,10 @@ def is_public_file(rel):
 
 
 class Handler(SimpleHTTPRequestHandler):
+    # 不依赖系统注册表猜类型：Windows 上 .js 有时被登记成 text/plain，浏览器会拒绝加载模块脚本
+    extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.js': 'text/javascript', '.mjs': 'text/javascript',
+                      '.wasm': 'application/wasm', '.json': 'application/json', '.md': 'text/markdown; charset=utf-8'}
+
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=str(ROOT), **kw)
 

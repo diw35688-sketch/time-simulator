@@ -11,11 +11,11 @@ sys.path.insert(0, str(ROOT / 'tests'))
 from _static import BASE, serve
 
 W, H = 1280, 720
-HIDE = '#hud, #tip, #sound, #stBtn, #stPanel, #camSel, #banner { display: none !important; }'
+HIDE = '#hud, #tip, #sound, #stBtn, #stPanel, #camSel, #banner, #caption { display: none !important; }'
 CAPTION_JS = """(() => { const d = document.createElement('div'); d.id = 'cap';
   d.style.cssText = 'position:fixed;left:0;right:0;bottom:44px;text-align:center;color:#e6fff0;font:600 34px "Microsoft YaHei","PingFang SC",sans-serif;letter-spacing:.08em;text-shadow:0 0 14px #1dff5e,0 0 3px #000;pointer-events:none';
   document.body.appendChild(d); })()"""
-UPDATE_JS = """(() => { const t = window.timespell.getTime(), s = window.timespell.stage();
+UPDATE_JS = """(() => { const t = window.timespell.stageT(), s = window.timespell.stage();
   document.getElementById('cap').textContent = (t > 0.02 ? '未来 · ' : t < -0.02 ? '过去 · ' : '现在 · ') + s; })()"""
 FONTS = ['C:/Windows/Fonts/msyh.ttc', '/System/Library/Fonts/PingFang.ttc', '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc']
 BG = (7, 11, 9)

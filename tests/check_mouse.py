@@ -50,17 +50,20 @@ async def run(b, query):
     for _ in range(12):
         await pg.mouse.wheel(0, 100)
         await pg.wait_for_timeout(150)
-        fwd.append(round((await st())['t'], 3))
+        fwd.append(round((await st())['tTarget'], 3))
+    await pg.wait_for_timeout(600)
     s = await st()
     out['forward'] = fwd
-    out['arc_ok'] = abs(s['arcLen'] - abs(s['t']) * math.radians(s['lifeDeg']) / 2) < 1e-3
+    out['display_follows'] = abs(s['t'] - s['tTarget']) < 1e-3   # 显示的时间平滑地追上目标
+    out['dial_ok'] = abs(s['dialAngle'] - s['t'] * math.radians(s['lifeDeg']) / 2) < 1e-6
     out['stage_at_+1'] = await pg.evaluate('window.timespell.stage()')
     back = []
     for _ in range(24):
         await pg.mouse.wheel(0, -100)
         await pg.wait_for_timeout(150)
-        back.append(round((await st())['t'], 3))
+        back.append(round((await st())['tTarget'], 3))
     out['backward'] = back
+    await pg.wait_for_timeout(600)
     s = await st()
     out['stage_at_-1'] = await pg.evaluate('window.timespell.stage()')
     out['object_t_matches'] = abs(await frame.evaluate('getTime()') - s['t']) < 1e-6
