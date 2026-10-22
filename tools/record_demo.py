@@ -72,7 +72,7 @@ async def demo_gif(b, out):
         for _ in range(hold):
             await snap()
     await ctx.close()
-    vf = ('crop=760:540:340:170,scale=640:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128:stats_mode=diff[p];'
+    vf = ('crop=760:540:340:170,scale=640:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=96:stats_mode=diff[p];'
           '[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle')
     subprocess.run(['ffmpeg', '-v', 'error', '-y', '-framerate', '12', '-i', str(tmp / '%04d.png'), '-vf', vf, '-loop', '0', str(out)], check=True)
     shutil.rmtree(tmp)
