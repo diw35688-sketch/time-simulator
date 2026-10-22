@@ -75,7 +75,7 @@ def assemble(dest):
             (out / (rel + '.part' + str(i))).write_bytes(blob[i * CHUNK:(i + 1) * CHUNK])
         manifest[rel] = {'parts': n, 'size': len(blob), 'sha256': hashlib.sha256(blob).hexdigest()}
     (out / 'parts.json').write_text(json.dumps(manifest, indent=1), encoding='utf8')
-    big = [p for p in dest.rglob('*') if p.is_file() and p.stat().st_size > CHUNK + 1024 * 1024]
+    big = [p for p in dest.rglob('*') if p.is_file() and '.git' not in p.relative_to(dest).parts and p.stat().st_size > CHUNK + 1024 * 1024]
     if big:
         sys.exit('还有超过 5MB 的文件：' + '、'.join(str(p.relative_to(dest)) for p in big))
     return manifest
