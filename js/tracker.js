@@ -67,10 +67,13 @@ export function handFeatures(lm, map) {
 export const TRACK_DEFAULTS = {
   pos: [1.0, 0.02, 2.0],      // OneEuro：静止时的截止频率 Hz、随速度提高截止频率的系数、速度估计的截止频率
   len: [2.0, 0.06, 2.0],      // 手掌长度决定法阵大小：手往镜头前推、往后撤时要跟得上
-  roll: [3.0, 0.4, 2.0],
-  lead: 0.55, maxLead: 80, velK: 0.5,   // 按速度外推到“现在”，抵消识别延迟（ms）
+  roll: [3.0, 8.0, 2.0],      // 转角以弧度计，速度系数要大一些，转得快时才跟得上
+  // 外推：法阵要对齐的是屏幕上的手，而屏幕上的画面本身就比真实的手晚 dispLatency（摄像头拍下到显示出来），
+  // 所以按速度外推到“当前显示的这一帧拍下的时刻”，而不是外推到现在（那样会跑到画面里的手前面去）
+  dispLatency: 30, lead: 0.9, rollLead: 0.6, maxLead: 100, velK: 0.7,
   leadMinSpeed: 25, leadRamp: 100,   // px/s：慢于这个速度不外推，免得放大静止时的抖动
-  tauPos: 0.024, tauRoll: 0.02, tauLen: 0.02, tauSlow: 0.06,
+  rollMinSpeed: 0.3, rollRamp: 0.6,  // rad/s：转角同理
+  tauPos: 0.012, tauRoll: 0.012, tauLen: 0.02, tauSlow: 0.035, tauN: 0.04, tauArm: 0.04,
   grace: 220, reset: 450,     // ms：短暂丢失时继续沿用；超过 reset 就当成新的一只手
   openOn: 1.55, openOff: 1.25, openFrames: 2,
   rollJump: 0.8,              // rad：两帧之间转动超过这个角度当成识别错误
@@ -78,7 +81,7 @@ export const TRACK_DEFAULTS = {
   // 它们变化慢，单独平滑；前臂方向本身跟着手的转角实时走，所以不会被姿态识别的速度拖慢
   armRatio: 2.6,             // 前臂长 / 手掌长（三维）
   armTilt: 0.6,              // rad：没有姿态识别时，假设前臂往镜头里倾斜的角度
-  maxBend: 1.1, tauBend: 0.12, poseHold: 1500,
+  maxBend: 1.1, tauBend: 0.06, poseHold: 1500,
 };
 
 function newSlot(k, p) {
@@ -158,8 +161,8 @@ export class HandTracker {
       s.roll.push(s.rollU, dt);
       s.rollPrev = f.roll;
     }
-    const k = fresh ? 1 : 1 - Math.exp(-dt / 0.08);
-    s.n = nlerp3(s.n, f.n, k); s.up = nlerp3(s.up, f.up, k);
+    const k = fresh ? 1 : 1 - Math.exp(-dt / 0.08), kn = fresh ? 1 : 1 - Math.exp(-dt / p.tauN);
+    s.n = nlerp3(s.n, f.n, kn); s.up = nlerp3(s.up, f.up, kn);
     // 手腕位置记成相对手掌的极坐标（距离 / 手掌长、相对手指方向的角度），画的时候按当前转角和大小还原，转手时手腕跟着转
     const wox = f.S[0][0] - f.x, woy = f.S[0][1] - f.y;
     const woR = Math.hypot(wox, woy) / f.len, woA = angDiff(Math.atan2(woy, wox), f.roll);
@@ -215,21 +218,24 @@ export class HandTracker {
       s.seen = s.active && age < this.grace;
       if (!s.seen) continue;
       const gate = clamp((Math.hypot(s.cx.v, s.cy.v) - p.leadMinSpeed) / p.leadRamp, 0, 1);
-      const lead = c => Math.min(Math.max(age, 0) + c.lag * 1000, p.maxLead) / 1000 * p.lead * gate;
-      const tx = s.cx.x + s.cx.v * lead(s.cx), ty = s.cy.x + s.cy.v * lead(s.cy);
+      const rgate = clamp((Math.abs(s.roll.v) - p.rollMinSpeed) / p.rollRamp, 0, 1);
+      // 外推多久：从这次识别用的那帧拍下，到屏幕上正显示的那帧拍下，再加上滤波本身的滞后
+      const ahead = c => clamp(age - p.dispLatency + c.lag * 1000, 0, p.maxLead) / 1000;
+      const tx = s.cx.x + s.cx.v * ahead(s.cx) * p.lead * gate, ty = s.cy.x + s.cy.v * ahead(s.cy) * p.lead * gate;
+      const troll = s.roll.x + s.roll.v * ahead(s.roll) * p.rollLead * rgate;
       const d = s.d;
       if (!d.init) {
-        Object.assign(d, { init: true, x: tx, y: ty, roll: s.roll.x, len: s.len.x, n: s.n, up: s.up, bend: s.bend });
+        Object.assign(d, { init: true, x: tx, y: ty, roll: troll, len: s.len.x, n: s.n, up: s.up, bend: s.bend });
       } else {
         d.x += (tx - d.x) * k(p.tauPos); d.y += (ty - d.y) * k(p.tauPos);
-        d.roll += (s.roll.x - d.roll) * k(p.tauRoll);
+        d.roll += (troll - d.roll) * k(p.tauRoll);
         d.len += (s.len.x - d.len) * k(p.tauLen);
         d.n = nlerp3(d.n, s.n, k(p.tauSlow)); d.up = nlerp3(d.up, s.up, k(p.tauSlow));
       }
       d.wx = d.x + Math.cos(d.roll + s.woA) * s.woR * d.len;
       d.wy = d.y + Math.sin(d.roll + s.woA) * s.woR * d.len;
       // 姿态识别一段时间没来，弯曲角、长度和倾斜慢慢退回默认值
-      const conf = Math.exp(-Math.max(0, now - s.poseTs) / p.poseHold), ka = k(0.08);
+      const conf = Math.exp(-Math.max(0, now - s.poseTs) / p.poseHold), ka = k(p.tauArm);
       d.bend += angDiff(s.bend * conf, d.bend) * ka;
       const ang = d.roll + Math.PI + d.bend;
       d.arm = [Math.cos(ang), Math.sin(ang)];
@@ -258,7 +264,7 @@ export class TimeDial {
   }
 }
 
-export const INTERACT_DEFAULTS = { tauT: 0.06, wheelStep: 0.001, backlash: 0.012 };
+export const INTERACT_DEFAULTS = { tauT: 0.015, wheelStep: 0.001, backlash: 0.012 };
 
 // 法阵的出现和拨时间。rigs：每个法阵 { want（张开=1）, roll, key（手的槽位+跟踪纪元，鼠标为 null） }。
 // 张开手掌、法阵出来就能拨，不用靠近物品；两只手都张开时，先张开的那只说了算

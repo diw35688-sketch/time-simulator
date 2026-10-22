@@ -7,7 +7,7 @@ from playwright.async_api import async_playwright
 from _static import BASE, serve
 
 VIDEO = pathlib.Path(tempfile.gettempdir()) / 'timesim-hand' / 'hand.y4m'
-CONFIGS = {'auto': ('后台线程，CPU 先用、GPU 好了切换', ''), 'cpu': ('后台线程，只用 CPU', '?delegate=cpu'), 'main': ('主线程（旧方式）', '?detector=main')}
+CONFIGS = {'auto': ('后台线程，CPU 先用、GPU 好了切换', ''), 'posecpu': ('同上，手臂识别放在 CPU 上', '?posedelegate=cpu'), 'cpu': ('后台线程，只用 CPU', '?delegate=cpu'), 'main': ('主线程（旧方式）', '?detector=main')}
 # 录制时间 r（ms）≈ 视频时间 - 2000（从手出现开始录）
 OBJ = next((a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--object=')), None)   # 换一个物品测
 WINDOWS = {'still': (300, 1500), 'lockA': (300, 1500), 'lockO': (3500, 3950), 'after60': (6400, 6950), 'back': (9400, 9950), 'after30': (12400, 12950)}
@@ -25,8 +25,8 @@ async def run(p, key):
     await pg.goto(f'{BASE}/index.html{query}' + (('&' if query else '?') + 'object=' + OBJ if OBJ else ''))
     await pg.wait_for_function("window.__timespell && window.__timespell().handStatus.startsWith('就绪')", timeout=90000)
     # 自动模式要等 GPU 和手臂识别都预热好（第一次打开要二三十秒），再对齐到视频里“手出现”的那一刻
-    if key == 'auto':
-        await pg.wait_for_function("window.__timespell().handStatus.includes('手臂')", timeout=90000)
+    if key in ('auto', 'posecpu'):
+        await pg.wait_for_function("window.__timespell().handStatus.includes('GPU') && window.__timespell().handStatus.includes('手臂')", timeout=90000)
     await pg.wait_for_timeout(3000)
     # 视频里有 2.5 秒没有手，连续 1.2 秒看不到手才算到了这段空档，避免识别中途丢一下手就误对齐
     await pg.wait_for_function("""(() => { const w = window; if (w.__timespell().hands > 0) { w.__noHand = 0; return false; }

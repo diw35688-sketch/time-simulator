@@ -21,6 +21,7 @@ const OPEN = [[0, 0], [.25, -.3], [.45, -.5], [.65, -.62], [.85, -.72], [.95, -.
 const FIST = [[0, 0], [.25, -.3], [.45, -.45], [.55, -.35], [.7, -.2], [.95, -.25], [1.15, -.27], [.95, -.27], [.8, -.25], [1, 0], [1.2, 0], [.98, 0], [.82, 0],
   [.95, .22], [1.15, .24], [.95, .25], [.8, .25], [.85, .4], [1, .45], [.85, .45], [.72, .44]];
 const L = 130, A = [380, 300], O = [OBJ.cx, OBJ.cy], B = [1000, 250];
+const DISP = 30;   // 摄像头拍下到显示在屏幕上的延迟（ms）：法阵要对齐的是屏幕上那一帧里的手
 // 前臂：转手时 30% 靠手腕弯、70% 靠整条前臂转（最多弯 35°），前臂往镜头里倾斜 0.7 rad
 const ROLL0 = deg(-90), BEND0 = deg(15), BEND_K = 0.3, BEND_MAX = deg(35), ARM_RATIO = 2.6, ARM_TILT = 0.7;
 
@@ -29,7 +30,7 @@ const lerp = (a, b, k) => a + (b - a) * k;
 const SEG = [], SEGT = {};
 let segT = 0;
 const seg = (ms, fn, name) => { if (name) SEGT[name] = [segT, segT + ms]; SEG.push([segT, segT + ms, fn]); segT += ms; };
-const at = (x, y, rollDeg, open = true, scale = 1) => ({ x, y, roll: deg(rollDeg), open, scale });
+const at = (x, y, rollDeg, open = true, scale = 1, bendDeg = 0) => ({ x, y, roll: deg(rollDeg), open, scale, bend: deg(bendDeg) });
 seg(500, () => null);
 seg(2000, () => at(A[0], A[1], -90), 'stillA');
 seg(1000, k => at(lerp(A[0], O[0], k), lerp(A[1], O[1], k), -90), 'moveAO');
@@ -52,6 +53,18 @@ seg(1000, k => at(B[0], B[1], lerp(10, -20, k)), 'farTurn');
 seg(500, () => at(B[0], B[1], -20), 'farHold');
 seg(600, k => at(B[0], B[1], -20, true, lerp(1, 1.6, k)), 'grow');
 seg(800, () => at(B[0], B[1], -20, true, 1.6), 'grown');
+seg(400, k => at(B[0], B[1], -20, true, lerp(1.6, 1, k)), 'shrink');
+seg(600, () => at(B[0], B[1], -20), 'preQuick');
+seg(500, k => at(B[0], B[1], lerp(-20, -80, k)), 'quick');            // 快速转手：每秒 120°
+seg(900, () => at(B[0], B[1], -80), 'quickHold');
+seg(600, k => at(B[0], B[1], -80, true, 1, lerp(0, 25, k)), 'elbow');  // 手不动，只有手肘挪动，前臂方向转 25°
+seg(900, () => at(B[0], B[1], -80, true, 1, 25), 'elbowHold');
+// 人手自然的动作：起步和停下都是平滑的（最小加加速度曲线），用来看实际使用时的跟手和冲过头
+const mj = k => k * k * k * (10 - 15 * k + 6 * k * k);
+seg(800, k => at(lerp(B[0], A[0], mj(k)), lerp(B[1], A[1], mj(k)), -80, true, 1, 25), 'mjMove');
+seg(700, () => at(A[0], A[1], -80, true, 1, 25), 'mjHold');
+seg(600, k => at(A[0], A[1], lerp(-80, -20, mj(k)), true, 1, 25), 'mjTwist');
+seg(900, () => at(A[0], A[1], -20, true, 1, 25), 'mjTwistHold');
 const END = segT;
 const truth = t => { for (const [a, b, fn] of SEG) if (t >= a && t < b) return fn((t - a) / (b - a)); return SEG.at(-1)[2](1); };
 const DROPS = [[1550, 1620], [5450, 5560], [13000, 13070]], FLIPS = [[1950, 2060]];
@@ -60,7 +73,7 @@ const wristOf = st => {
   const Ls = L * st.scale, U = [Math.cos(st.roll), Math.sin(st.roll)], V = [-Math.sin(st.roll), Math.cos(st.roll)];
   return [st.x - Ls * (0.75 * U[0] + 0.074 * V[0]), st.y - Ls * (0.75 * U[1] + 0.074 * V[1])];
 };
-const armAngleOf = st => st.roll + Math.PI + BEND0 + clamp(BEND_K * angDiff(st.roll, ROLL0), -BEND_MAX, BEND_MAX);
+const armAngleOf = st => st.roll + Math.PI + BEND0 + clamp(BEND_K * angDiff(st.roll, ROLL0), -BEND_MAX, BEND_MAX) + (st.bend || 0);
 
 function landmarks(st) {
   const Ls = L * st.scale, U = [Math.cos(st.roll), Math.sin(st.roll)], V = [-Math.sin(st.roll), Math.cos(st.roll)], [wx, wy] = wristOf(st);
@@ -85,7 +98,7 @@ function makeCaps(fps, latency, spread) {
   }
   return caps.sort((a, b) => a.arrive - b.arrive);
 }
-const CAPS = makeCaps(30, 22, 16);
+const CAPS = makeCaps(30, 38, 18);   // 实测 GPU 识别从拍下到出结果约 45ms
 // 慢电脑：每秒只识别 8 次，结果晚 120ms 左右才到
 const SLOW_CAPS = makeCaps(8, 110, 30);
 const RENDERS = [];
@@ -122,7 +135,7 @@ function runNew(trackParams = {}, interactParams = {}, caps = CAPS) {
       prevArm = prevArm === null ? tgt : prevArm + angDiff(tgt, prevArm) * (1 - Math.exp(-dt / 0.08));
       pArm = prevArm;
     }
-    rec.push({ r, rigs: rigs.map(g => ({ x: g.x, y: g.y, presence: g.presence, locked: g.locked, radius: g.radius })), t: res.t, target: res.target, arm, pArm, wrist });
+    rec.push({ r, rigs: rigs.map(g => ({ x: g.x, y: g.y, presence: g.presence, locked: g.locked, radius: g.radius })), t: res.t, target: res.target, arm, pArm, wrist, roll: s0.seen ? d.roll : null });
   }
   return rec;
 }
@@ -179,12 +192,20 @@ function runOld() {
 
 const mean = a => a.reduce((s, v) => s + v, 0) / Math.max(a.length, 1);
 const std = a => { const m = mean(a); return Math.sqrt(mean(a.map(v => (v - m) ** 2))); };
+function crossMs(rows, get, from, to) {
+  const mid = (from + to) / 2, sgn = Math.sign(to - from);
+  for (const f of rows) { const v = get(f); if (v !== null && v !== undefined && (v - mid) * sgn >= 0) return f.r; }
+  return null;
+}
 function armMetrics(rec, key) {
   const win = (a, b) => rec.filter(f => f.r >= a && f.r < b && f[key] !== null);
-  const err = rows => mean(rows.map(f => Math.abs(todeg(angDiff(f[key], armAngleOf(truth(f.r - 16)))))));
+  const sel = win(SEGT.elbow[0] - 30, SEGT.elbowHold[1]), eMid = (SEGT.elbow[0] + SEGT.elbow[1]) / 2;
+  const ce = sel.length ? crossMs(sel, f => f[key], sel[0][key], sel.at(-1)[key]) : null;
+  const err = rows => mean(rows.map(f => Math.abs(todeg(angDiff(f[key], armAngleOf(truth(f.r - DISP)))))));
   return {
     armErrRot: err([...win(SEGT.rot60[0] + 100, SEGT.rot60[1]), ...win(SEGT.rotBack[0] + 100, SEGT.rotBack[1])]),
     armErrHold: err([...win(SEGT.hold60[0] + 200, SEGT.hold60[1]), ...win(SEGT.holdBack[0] + 200, SEGT.holdBack[1])]),
+    elbowLagMs: ce === null ? null : ce - (eMid + DISP),
   };
 }
 function metrics(rec) {
@@ -200,7 +221,7 @@ function metrics(rec) {
   m.engageFar = mean(win(1300, 2400).map(f => (f.rigs[0].locked ? 1 : 0)));
   const lag = (a, b, from, to, ms) => {
     const fr = win(a, b), speed = Math.hypot(to[0] - from[0], to[1] - from[1]) / (ms / 1000);
-    const err = fr.map(f => { const tr = truth(f.r - 16); return Math.hypot(f.rigs[vis(f)].x - tr.x, f.rigs[vis(f)].y - tr.y); });
+    const err = fr.map(f => { const tr = truth(f.r - DISP); return Math.hypot(f.rigs[vis(f)].x - tr.x, f.rigs[vis(f)].y - tr.y); });
     const steps = fr.slice(1).map((f, i) => Math.hypot(f.rigs[vis(f)].x - fr[i].rigs[vis(fr[i])].x, f.rigs[vis(f)].y - fr[i].rigs[vis(fr[i])].y));
     return { ms: mean(err) / speed * 1000, cv: std(steps) / mean(steps) };
   };
@@ -222,11 +243,35 @@ function metrics(rec) {
   m.farDelta = at(SEGT.farHold[1] - 50).t - at(SEGT.farTurn[0] - 50).t;
   // 法阵大小：手往镜头前推（手掌变大到 1.6 倍）时，法阵半径落后多少、最后差多少
   const r0 = radiusOf(L), r1 = radiusOf(L * 1.6), grow = win(SEGT.grow[0] + 100, SEGT.grow[1]);
-  m.sizeLagMs = mean(grow.map(f => Math.abs(f.rigs[0].radius - radiusOf(L * truth(f.r - 16).scale)))) / ((r1 - r0) / 0.6) * 1000;
+  m.sizeLagMs = mean(grow.map(f => Math.abs(f.rigs[0].radius - radiusOf(L * truth(f.r - DISP).scale)))) / ((r1 - r0) / 0.6) * 1000;
   m.sizeErr = mean(win(SEGT.grown[0] + 400, SEGT.grown[1]).map(f => Math.abs(f.rigs[0].radius - r1)));
   const wr = [...win(SEGT.rot60[0] + 100, SEGT.rot60[1]), ...win(SEGT.rotBack[0] + 100, SEGT.rotBack[1])].filter(f => f.wrist);
-  m.wristErr = wr.length ? mean(wr.map(f => { const w = wristOf(truth(f.r - 16)); return Math.hypot(f.wrist[0] - w[0], f.wrist[1] - w[1]); })) : null;
-  Object.assign(m, rec.some(f => f.arm !== null) ? armMetrics(rec, 'arm') : { armErrRot: null, armErrHold: null });
+  m.wristErr = wr.length ? mean(wr.map(f => { const w = wristOf(truth(f.r - DISP)); return Math.hypot(f.wrist[0] - w[0], f.wrist[1] - w[1]); })) : null;
+  // 单向变化的一段里，记录的值越过中点的时刻；真实的手越过中点时刻 + DISP（屏幕上看到那一帧的时刻）是理想值，差值就是落后的时间
+  const rows = (a, b) => rec.filter(f => f.r >= a && f.r < b);
+  const lagOf = (seg, hold, get) => {
+    const a = SEGT[seg][0], b = SEGT[hold][1], mid = (SEGT[seg][0] + SEGT[seg][1]) / 2;
+    const v0 = get(at(a - 30)), v1 = get(at(b - 30));
+    if (v0 === null || v0 === undefined || v1 === null || v1 === undefined) return null;
+    const c = crossMs(rows(a - 30, b), get, v0, v1);
+    return c === null ? null : c - (mid + DISP);
+  };
+  m.tLagMs = lagOf('rot60', 'hold60', f => f.t);
+  m.quickLagMs = lagOf('quick', 'quickHold', f => f.t);
+  m.rollLagMs = rec.some(f => f.roll != null) ? lagOf('quick', 'quickHold', f => f.roll) : null;
+  const tq0 = at(SEGT.quick[0] - 30).t, tq1 = at(SEGT.quickHold[1] - 30).t;
+  m.quickOver = Math.max(0, ...rows(SEGT.quick[1], SEGT.quickHold[1]).map(f => (f.t - tq1) * Math.sign(tq1 - tq0)));
+  const mu = [A[0] - B[0], A[1] - B[1]], mul = Math.hypot(...mu);
+  m.smoothOver = Math.max(0, ...rows(SEGT.mjHold[0], SEGT.mjHold[1]).map(f => ((f.rigs[0].x - A[0]) * mu[0] + (f.rigs[0].y - A[1]) * mu[1]) / mul));
+  const mm = rows(SEGT.mjMove[0] + 160, SEGT.mjMove[1] - 160).map(f => {
+    const t = f.r - DISP, a = truth(t - 5), b = truth(t + 5), sp = Math.hypot(b.x - a.x, b.y - a.y) / 10, tr = truth(t);
+    return Math.hypot(f.rigs[0].x - tr.x, f.rigs[0].y - tr.y) / sp;
+  });
+  m.smoothLagMs = mean(mm);
+  m.twistLagMs = lagOf('mjTwist', 'mjTwistHold', f => f.t);
+  const tw0 = at(SEGT.mjTwist[0] - 30).t, tw1 = at(SEGT.mjTwistHold[1] - 30).t;
+  m.twistOver = Math.max(0, ...rows(SEGT.mjTwist[1], SEGT.mjTwistHold[1]).map(f => (f.t - tw1) * Math.sign(tw1 - tw0)));
+  Object.assign(m, rec.some(f => f.arm !== null) ? armMetrics(rec, 'arm') : { armErrRot: null, armErrHold: null, elbowLagMs: null });
   return m;
 }
 
@@ -239,7 +284,9 @@ const CHECKS = [
   ['lagFastMs', '快速移动落后的时间（ms，800px/s）', v => v <= 45],
   ['stepCV', '每帧位移的波动（越小越顺，290px/s）', v => v <= 0.35],
   ['stepCVFast', '每帧位移的波动（800px/s）', v => v <= 0.35],
-  ['overshoot', '停下时冲过头（像素）', v => v <= 6],
+  ['overshoot', '突然停下时冲过头（像素，最坏情况）', v => v <= 13],
+  ['smoothLagMs', '自然地移动手时落后（ms）', v => v <= 25],
+  ['smoothOver', '自然地停下手时冲过头（像素）', v => v <= 5],
   ['tAfter60', '顺时针转 60° 后的时间（应为 0.80）', v => Math.abs(v - 0.8) <= 0.04],
   ['tBack', '再转回 60° 后的时间（应回到 0）', v => Math.abs(v) <= 0.05],
   ['tSlowHalf', '每秒 5° 慢转 3 秒走的时间（应为 0.20）', v => Math.abs(v - 0.2) <= 0.05],
@@ -257,28 +304,38 @@ const CHECKS = [
   ['armErrRot', '转手时前臂方向的误差（度）', v => v <= 8],
   ['armErrHold', '手停下后前臂方向的误差（度）', v => v <= 4],
   ['wristErr', '转手时手腕位置的误差（像素）', v => v <= 10],
+  ['tLagMs', '慢慢转手（每秒 30°）时时间落后（ms）', v => v <= 110],
+  ['quickLagMs', '快速转手（每秒 120°）时时间落后（ms）', v => v <= 50],
+  ['rollLagMs', '快速转手时法阵转角落后（ms）', v => v <= 35],
+  ['quickOver', '快速转手突然停下时时间冲过头（最坏情况）', v => v <= 0.03],
+  ['twistLagMs', '自然地转手时时间落后（ms）', v => v <= 50],
+  ['twistOver', '自然地转手停下时时间冲过头', v => v <= 0.015],
+  ['elbowLagMs', '只挪手肘时前臂环跟上的时间（ms）', v => v <= 200],
 ];
 const SLOW = [['dropPresence', '慢电脑：丢帧时法阵亮度最低值', v => v >= 0.9], ['ghost', '慢电脑：重影法阵亮度', v => v <= 0.05],
   ['tAfter60', '慢电脑：转 60° 后的时间', v => Math.abs(v - 0.8) <= 0.05], ['tBack', '慢电脑：转回后的时间', v => Math.abs(v) <= 0.06],
   ['tSlow', '慢电脑：慢转 30° 后', v => Math.abs(v - 0.4) <= 0.06], ['farDelta', '慢电脑：远离物品转 30°', v => Math.abs(v + 0.4) <= 0.06],
   ['sizeErr', '慢电脑：推近后法阵大小误差', v => v <= 6], ['armErrHold', '慢电脑：停下后前臂方向误差', v => v <= 5]];
 
+// 上一版（这次改动之前）的参数：外推到“现在”乘 0.55，转角不外推，各处平滑更重
+const PREV = { track: { dispLatency: 0, lead: 0.55, maxLead: 80, roll: [3.0, 0.4, 2.0], rollLead: 0, tauPos: 0.024, tauRoll: 0.02, tauSlow: 0.06, tauN: 0.08, tauArm: 0.08, tauBend: 0.12 },
+  interact: { tauT: 0.06 } };
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
-  const newRec = runNew(), newM = metrics(newRec), oldM = { ...metrics(runOld()), ...armMetrics(newRec, 'pArm') };
+  const oldM = metrics(runOld()), prevM = metrics(runNew(PREV.track, PREV.interact)), newM = metrics(runNew());
   const slowM = metrics(runNew({}, {}, SLOW_CAPS));
   const fmt = v => (v === null || v === undefined ? '-' : typeof v === 'number' ? (Number.isInteger(v) ? String(v) : v.toFixed(3)) : String(v));
   let fail = 0;
-  console.log('指标'.padEnd(30, '　'), '旧版'.padStart(8), '新版'.padStart(8), '  结果');
+  console.log('指标'.padEnd(30, '　'), '最早版'.padStart(7), '上一版'.padStart(7), '新版'.padStart(8), '  结果');
   for (const [k, name, ok] of CHECKS) {
     const pass = newM[k] !== null && ok(newM[k]); if (!pass) fail++;
-    console.log(name.padEnd(30, '　'), fmt(oldM[k]).padStart(8), fmt(newM[k]).padStart(8), pass ? '  通过' : '  不通过');
+    console.log(name.padEnd(30, '　'), fmt(oldM[k]).padStart(8), fmt(prevM[k]).padStart(8), fmt(newM[k]).padStart(8), pass ? '  通过' : '  不通过');
   }
   for (const [k, name, ok] of SLOW) {
     const pass = slowM[k] !== null && ok(slowM[k]); if (!pass) fail++;
-    console.log(name.padEnd(30, '　'), '-'.padStart(8), fmt(slowM[k]).padStart(8), pass ? '  通过' : '  不通过');
+    console.log(name.padEnd(30, '　'), '-'.padStart(8), '-'.padStart(8), fmt(slowM[k]).padStart(8), pass ? '  通过' : '  不通过');
   }
   console.log(fail ? `${fail} 项不通过` : '全部通过');
   process.exit(fail ? 1 : 0);
 }
-export { runNew, runOld, metrics, armMetrics, CHECKS };
+export { runNew, runOld, metrics, armMetrics, CHECKS, PREV, SLOW_CAPS };

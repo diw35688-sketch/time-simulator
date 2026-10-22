@@ -11,9 +11,11 @@ PATH = sys.argv[1].replace(chr(92), '/').lstrip('./')
 W, H = 1280, 720
 SCRUB_JS = """async () => {
   const frame = () => new Promise(r => requestAnimationFrame(r)), heap = () => (performance.memory ? performance.memory.usedJSHeapSize : 0);
-  for (let i = 0; i < 30; i++) { window.setTime(Math.sin(i / 12)); await frame(); }
+  // 和宿主页面一样用 postMessage 发时间（嵌入模式下的降频补丁靠这个消息知道时间变了）
+  const send = t => window.postMessage({ type: 'timespell:setTime', t }, '*');
+  for (let i = 0; i < 30; i++) { send(Math.sin(i / 12)); await frame(); }
   const mem0 = heap(), times = []; let last = performance.now();
-  for (let i = 0; i < 240; i++) { window.setTime(Math.sin(i / 12)); await frame(); const now = performance.now(); times.push(now - last); last = now; }
+  for (let i = 0; i < 240; i++) { send(Math.sin(i / 12)); await frame(); const now = performance.now(); times.push(now - last); last = now; }
   const mem1 = heap(); times.sort((a, b) => a - b);
   return { avgMs: +(times.reduce((s, v) => s + v, 0) / times.length).toFixed(1), p95Ms: +times[Math.floor(times.length * .95)].toFixed(1), heapGrowMB: +((mem1 - mem0) / 1e6).toFixed(1) };
 }"""
@@ -81,7 +83,8 @@ def verdict(s, e):
     ok = lambda cond: '通过' if cond else '不通过'
     out = {
         '1 无报错': ok(not s.get('errors') and not e.get('errors') and 'FATAL' not in s and 'FATAL' not in e),
-        '2 帧率≥30': ok(min(s.get('fps', 0), e.get('fps', 0)) >= 30),
+        # 嵌入模式下时间不变时会故意少重画（prompts/embed_fix.html），所以帧率只看独立模式；拨动时的流畅度看第 7 条
+        '2 帧率≥30（独立模式）': ok(s.get('fps', 0) >= 30),
         '3 纯函数（往回拨逐像素复原）': ok(s.get('purity_px_changed%') == 0 and e.get('purity_px_changed%') == 0),
         '4 嵌入模式透明、无 UI': ok(e.get('corner_alpha_max') == 0 and not e.get('visible_ui') and e.get('t0_center') is not None),
         '5 过去/现在/未来明显不同': ok(min(e.get('diff_-1_vs_0', 0), e.get('diff_+1_vs_0', 0)) > 8),

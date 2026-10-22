@@ -159,12 +159,12 @@ $('stTest').onclick = async () => {
 // ---------- 生成 ----------
 let abort = null;
 const THREE_CDN = /https?:\/\/(cdn\.jsdelivr\.net|unpkg\.com|esm\.sh|cdnjs\.cloudflare\.com)\/[^"'\s]*three(@[\d.]+)?\/build\/three\.module(\.min)?\.js/g;
-// 模型经常只把画布设成透明、忘了 html/body 的背景，嵌入后整页黑底会盖住摄像头画面：统一补一段强制透明的样式
-const EMBED_FIX = '<style>html.ts-embed, html.ts-embed body { background: transparent !important; }</style>' + String.fromCharCode(10) +
-  "<script>if (new URLSearchParams(location.search).get('embed') === '1') document.documentElement.classList.add('ts-embed');</script>";
+// 统一补在物品页开头的一段（和 tools/objfix.py 用同一份 prompts/embed_fix.html）：嵌入模式下背景强制透明、时间不变时少重画
+let EMBED_FIX = null;
+const embedFixReady = fetch('prompts/embed_fix.html').then(r => (r.ok ? r.text() : null)).then(t => { EMBED_FIX = t && t.trim(); }, () => {});
 function checkHtml(html) {
   const fixes = [], warns = [];
-  if (!html.includes('ts-embed')) {
+  if (EMBED_FIX && !html.includes('queue = new Map()')) {
     const m = html.match(/<head[^>]*>/i) || html.match(/<html[^>]*>/i), at = m ? m.index + m[0].length : 0;
     html = html.slice(0, at) + String.fromCharCode(10) + EMBED_FIX + String.fromCharCode(10) + html.slice(at);
   }
@@ -259,6 +259,7 @@ async function generate() {
       (r, c) => status(st, c ? `写代码中… ${c.toLocaleString()} 字 · ${sec()}s` : `思考中… ${r.toLocaleString()} 字 · ${sec()}s`));
     const m = content.match(/```html\s*([\s\S]*?)```/) || content.match(/(<!doctype html[\s\S]*<\/html>)/i);
     if (!m) throw new Error(finish === 'length' ? '输出被截断（max_tokens 不够，思考过程用光了额度）。把「最大输出 token」调大后重试' : '回复里没有找到 HTML 代码');
+    await embedFixReady;
     let { html, fixes, warns } = checkHtml(m[1].trim());
     // 大模型偶尔会在代码里混进乱码 token，先解析语法，坏了就让它只修出错的那几行
     for (let round = 1; ; round++) {

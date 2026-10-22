@@ -2,7 +2,31 @@
 <html lang="zh-CN">
 <head>
 <style>html.ts-embed, html.ts-embed body { background: transparent !important; }</style>
-<script>if (new URLSearchParams(location.search).get('embed') === '1') document.documentElement.classList.add('ts-embed');</script>
+<script>
+(function () {
+  // 时间模拟器在物品页开头统一补上的一段（tools/objfix.py、设置面板生成物品时都会加）：只在嵌入模式下生效
+  if (new URLSearchParams(location.search).get('embed') !== '1') return;
+  // 1. 页面背景强制透明：模型常常只把画布设成透明，整页黑底会盖住摄像头画面
+  document.documentElement.classList.add('ts-embed');
+  // 2. 时间没变时最多每秒重画 10 次：物品是时间的纯函数，画面不变就不用每帧重画，把显卡让给手势识别
+  var raf = window.requestAnimationFrame.bind(window), queue = new Map(), nextId = 1, dirty = 3, last = 0;
+  addEventListener('message', function (e) { if (e.data && e.data.type === 'timespell:setTime') dirty = 3; });
+  addEventListener('resize', function () { dirty = 3; });
+  function tick(now) {
+    if (queue.size && (dirty > 0 || now - last >= 100)) {
+      if (dirty > 0) dirty--;
+      last = now;
+      var q = queue;
+      queue = new Map();
+      q.forEach(function (cb) { try { cb(now); } catch (err) { setTimeout(function () { throw err; }); } });
+    }
+    raf(tick);
+  }
+  window.requestAnimationFrame = function (cb) { var id = nextId++; queue.set(id, cb); return id; };
+  window.cancelAnimationFrame = function (id) { queue.delete(id); };
+  raf(tick);
+})();
+</script>
 
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
