@@ -66,7 +66,8 @@ class Handler(SimpleHTTPRequestHandler):
             # 物品是 AI 生成或别人贡献的代码：就算被单独打开，也跑在沙箱里，读不到本站的存储
             self.send_header('Content-Security-Policy', 'sandbox allow-scripts')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Cache-Control', 'no-store')
+        # 模型和第三方库很大（几十 MB）又不常变，缓存一天；页面和代码每次都向服务器确认有没有更新（没变就回 304）
+        self.send_header('Cache-Control', 'public, max-age=86400' if rel.startswith('vendor/') else 'no-cache')
         super().end_headers()
 
     def list_directory(self, path):

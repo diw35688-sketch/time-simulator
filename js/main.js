@@ -300,15 +300,20 @@ async function startCamera() {
 }
 
 // ---------- 识别：优先放在后台线程（Worker），不支持时退回主线程 ----------
-const det = { mode: '', delegate: '', pose: false, ready: false, busy: false, worker: null, hand: null, poser: null,
-  vw: 16, vh: 9, bench: Infinity, sentAt: 0, pumping: false, lastTs: 0, n: 0, cost: 0, latency: 0, rate: 0, count: 0, rateAt: performance.now(), poseEvery: 3, sent: 0, got: 0, dropped: 0 };
+const det = { mode: '', delegate: '', ready: false, busy: false, worker: null, hand: null, poser: null, vw: 16, vh: 9, bench: Infinity,
+  sentAt: 0, pumping: false, lastTs: 0, n: 0, cost: 0, latency: 0, rate: 0, count: 0, rateAt: performance.now(),
+  sent: 0, got: 0, dropped: 0, t0: 0, readyMs: 0, gpuMs: 0, poseMs: 0 };
+// 手臂（姿态）识别单独一个 GPU 线程：每 3 帧、看到手时才识别，只用来摆前臂环，不拖慢手的识别
+const poseDet = { ready: false, busy: false, worker: null, n: 0, sentAt: 0 };
 const LOCAL_MP = new URL('../vendor/mediapipe/', import.meta.url).href, CDN_MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/';
-const CANDIDATES = [
-  { base: LOCAL_MP, hand: LOCAL_MP + 'hand_landmarker.task', pose: LOCAL_MP + 'pose_landmarker_lite.task', local: true },
-  { base: CDN_MP, hand: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', pose: null, local: false },
+const HAND_MODELS = [
+  { base: LOCAL_MP, hand: LOCAL_MP + 'hand_landmarker.task', local: true },
+  { base: CDN_MP, hand: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', local: false },
 ];
-// 起一个识别线程，预热完成后给出 { w, delegate, pose, bench }（bench：预热后单帧耗时 ms）
-function spawnWorker(delegate) {
+const POSE_MODELS = [{ base: LOCAL_MP, pose: LOCAL_MP + 'pose_landmarker_lite.task', local: true }];
+
+// 起一个识别线程，预热完成后给出 { w, delegate, bench }（bench：预热后单帧耗时 ms）
+function spawnWorker(candidates, delegate) {
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('./detector-worker.js', import.meta.url));
     const fail = err => { w.terminate(); reject(err); };
@@ -316,43 +321,67 @@ function spawnWorker(delegate) {
     w.onmessage = e => {
       const m = e.data;
       if (m.type === 'error') fail(new Error(m.message));
-      else if (m.type === 'ready') resolve({ w, delegate: m.delegate, pose: m.pose, bench: m.bench });
+      else if (m.type === 'ready') resolve({ w, delegate: m.delegate, bench: m.bench });
     };
-    w.postMessage({ type: 'init', candidates: CANDIDATES, delegate });
+    w.postMessage({ type: 'init', candidates, delegate });
   });
+}
+function withTimeout(promise, ms, msg) {
+  let timer;
+  const limit = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(msg)), ms); });
+  return Promise.race([promise, limit]).finally(() => clearTimeout(timer))
+    .catch(err => { promise.then(info => info.w.terminate(), () => {}); throw err; });
+}
+function updateStatus() {
+  handStatus = '就绪 ' + (det.mode === 'worker' ? '后台' : '主线程') + ' ' + det.delegate + (poseDet.ready || det.poser ? ' + 手臂' : '');
 }
 function useWorker(info) {
   const old = det.worker;
-  Object.assign(det, { mode: 'worker', worker: info.w, delegate: info.delegate, pose: info.pose, bench: info.bench, ready: true, busy: false });
+  Object.assign(det, { mode: 'worker', worker: info.w, delegate: info.delegate, bench: info.bench, ready: true, busy: false });
   info.w.onerror = e => console.error('识别线程出错', e.message);
   info.w.onmessage = ev => {
     if (ev.data.type !== 'result' || ev.target !== det.worker) return;
     det.busy = false; det.got++;
     if (ev.data.error) return console.warn('识别出错', ev.data.error);
-    handleResult(ev.data.ts, ev.data.hands, ev.data.pose, ev.data.cost);
+    handleResult(ev.data.ts, ev.data.hands || [], ev.data.cost);
   };
   if (old && old !== info.w) old.terminate();
-  handStatus = '就绪 后台 ' + det.delegate + (det.pose ? ' + 手臂' : '');
+  updateStatus();
 }
-// 同时起 CPU 和 GPU 两个识别线程：CPU 马上能用；GPU 预热（编译着色器）可能要好几秒，好了以后更快就换过去
-function startWorkers(only) {
-  const kinds = only ? [only] : ['CPU', 'GPU'];
-  return new Promise((resolve, reject) => {
-    let pending = kinds.length;
-    const done = () => { if (--pending === 0 && !det.ready) reject(new Error('识别线程都没能启动')); };
-    for (const k of kinds) {
-      spawnWorker(k).then(info => {
-        if (!det.ready || det.mode !== 'worker') { useWorker(info); resolve(); }
-        else if (info.bench < det.bench * 0.8) useWorker(info);
-        else info.w.terminate();
-        done();
-      }, err => { console.warn(k + ' 识别线程不可用：', err.message); done(); });
-    }
-  });
+// 先起 CPU 线程，马上能用；再起 GPU 线程预热（编译着色器，第一次可能要十几秒，浏览器缓存后会快很多），
+// 好了而且比 CPU 实际跑起来快就换过去，40 秒还没好就放弃。手的 GPU 线程就绪后再起手臂识别线程
+async function startWorkers(only) {
+  const first = only || 'CPU';
+  det.t0 = performance.now();
+  try { useWorker(await spawnWorker(HAND_MODELS, first)); det.readyMs = performance.now() - det.t0; }
+  catch (err) { if (only) throw err; console.warn('CPU 识别线程不可用：', err.message); }
+  if (only === 'CPU') return;
+  if (det.delegate === 'GPU') { startPose(); return; }
+  const upgrade = withTimeout(spawnWorker(HAND_MODELS, 'GPU'), 40000, 'GPU 预热超过 40 秒').then(info => {
+    const cpuCost = det.cost > 0 ? det.cost : det.bench;
+    if (!det.ready || info.bench < cpuCost * 0.8) { useWorker(info); det.gpuMs = performance.now() - det.t0; startPose(); }
+    else { console.info(`GPU 单帧 ${info.bench.toFixed(0)}ms，不比 CPU 的 ${cpuCost.toFixed(0)}ms 快，继续用 CPU`); info.w.terminate(); }
+  }, err => console.warn('GPU 识别线程不用了：', err.message));
+  if (!det.ready) await upgrade;
+  if (!det.ready) throw new Error('识别线程都没能启动');
+}
+async function startPose() {
+  if (poseDet.worker) return;
+  try {
+    const info = await withTimeout(spawnWorker(POSE_MODELS, 'GPU'), 40000, '手臂识别预热超过 40 秒');
+    Object.assign(poseDet, { worker: info.w, ready: true });
+    det.poseMs = performance.now() - det.t0;
+    info.w.onmessage = ev => {
+      if (ev.data.type !== 'result') return;
+      poseDet.busy = false;
+      if (ev.data.pose && !ev.data.error) handlePose(ev.data.pose, ev.data.ts);
+    };
+    updateStatus();
+  } catch (err) { console.warn('手臂识别不可用，前臂环按手的方向估算：', err.message); }
 }
 async function startMainThread() {
   let lastErr;
-  for (const c of CANDIDATES) {
+  for (const c of HAND_MODELS) {
     try {
       const mp = await import(c.base + 'vision_bundle.mjs');
       const fs = await mp.FilesetResolver.forVisionTasks(c.base + 'wasm');
@@ -360,8 +389,9 @@ async function startMainThread() {
       const opts = { numHands: 2, minHandDetectionConfidence: .5, minHandPresenceConfidence: .5, minTrackingConfidence: .5 };
       det.delegate = 'GPU';
       try { det.hand = await make(mp.HandLandmarker, c.hand, 'GPU', opts); } catch { det.delegate = 'CPU'; det.hand = await make(mp.HandLandmarker, c.hand, 'CPU', opts); }
-      if (c.pose) try { det.poser = await make(mp.PoseLandmarker, c.pose, det.delegate, { numPoses: 1 }); } catch { det.poser = null; }
-      Object.assign(det, { mode: 'main', pose: !!det.poser, ready: true });
+      if (c.local) try { det.poser = await make(mp.PoseLandmarker, POSE_MODELS[0].pose, det.delegate, { numPoses: 1 }); } catch { det.poser = null; }
+      Object.assign(det, { mode: 'main', ready: true });
+      updateStatus();
       return;
     } catch (err) { lastErr = err; }
   }
@@ -378,7 +408,7 @@ async function startDetector(only = params.get('delegate')?.toUpperCase()) {
     if (params.get('detector') !== 'main' && typeof Worker === 'function' && typeof createImageBitmap === 'function' && typeof OffscreenCanvas === 'function') {
       await startWorkers(only).catch(err => console.warn('后台线程识别不可用，改在主线程识别：', err.message));
     }
-    if (!det.ready) { await startMainThread(); handStatus = '就绪 主线程 ' + det.delegate + (det.pose ? ' + 手臂' : ''); }
+    if (!det.ready) await startMainThread();
     if (bannerSlow) banner('');
     if (!det.pumping) { det.pumping = true; pumpFrames(); }
   } catch (err) {
@@ -387,8 +417,14 @@ async function startDetector(only = params.get('delegate')?.toUpperCase()) {
     handStatus = '模型失败';
   } finally { clearTimeout(slow); }
 }
-// 看门狗：识别线程 3 秒没回应（个别显卡驱动会卡住），就换成只用 CPU 的线程重来
+// 看门狗：识别线程 3 秒没回应（个别显卡驱动会卡住），手的识别换成只用 CPU 重来，手臂识别直接关掉
 function watchdog(now) {
+  if (poseDet.busy && now - poseDet.sentAt > 3000) {
+    console.warn('手臂识别线程 3 秒没有回应，关掉');
+    poseDet.worker?.terminate();
+    Object.assign(poseDet, { ready: false, busy: false, worker: null });
+    updateStatus();
+  }
   if (det.mode !== 'worker' || !det.busy || now - det.sentAt < 3000) return;
   console.warn('识别线程 3 秒没有回应，换 CPU 重启');
   det.worker?.terminate();
@@ -406,38 +442,41 @@ function pumpFrames() {
     poll();
   }
 }
+function sendFrame(target, ts) {
+  target.busy = true;
+  const k = Math.min(1, 640 / det.vw);
+  createImageBitmap(video, { resizeWidth: Math.round(det.vw * k), resizeHeight: Math.round(det.vh * k), resizeQuality: 'low' })
+    .then(bitmap => { target.sentAt = performance.now(); target.worker.postMessage({ type: 'frame', ts, bitmap }, [bitmap]); })
+    .catch(() => { target.busy = false; });
+}
 function onVideoFrame(capTs) {
   if (!det.ready || video.readyState < 2 || !video.videoWidth) return;
-  if (det.busy) { det.dropped++; return; }
   let ts = Math.round(capTs);
   if (ts <= det.lastTs) ts = det.lastTs + 1;
   det.lastTs = ts; det.vw = video.videoWidth; det.vh = video.videoHeight;
-  // 姿态（手肘）只用来摆前臂环，每 3 帧识别一次、看到手时才识别
-  const wantPose = det.pose && det.n++ % det.poseEvery === 0 && tracker.slots.some(s => s.seen);
+  const seen = tracker.slots.some(s => s.seen);
   if (det.mode === 'worker') {
-    det.busy = true;
-    const k = Math.min(1, 640 / det.vw);
-    createImageBitmap(video, { resizeWidth: Math.round(det.vw * k), resizeHeight: Math.round(det.vh * k), resizeQuality: 'low' })
-      .then(bitmap => { det.sent++; det.sentAt = performance.now(); det.worker.postMessage({ type: 'frame', ts, bitmap, wantPose }, [bitmap]); })
-      .catch(() => { det.busy = false; });
+    if (det.busy) det.dropped++; else { det.sent++; sendFrame(det, ts); }
+    if (poseDet.ready && !poseDet.busy && seen && poseDet.n++ % 3 === 0) sendFrame(poseDet, ts);
     return;
   }
   const t0 = performance.now(), r = det.hand.detectForVideo(video, ts), hd = r.handedness || r.handednesses || [];
   const hands = (r.landmarks || []).map((lm, i) => ({ lm, handed: hd[i]?.[0]?.categoryName || '', score: hd[i]?.[0]?.score ?? 1 }));
-  let pose = null;
-  if (wantPose && hands.length && det.poser) {
+  handleResult(ts, hands, performance.now() - t0);
+  if (det.poser && seen && det.n++ % 3 === 0) {
     const p = det.poser.detectForVideo(video, ts).landmarks?.[0];
-    if (p) pose = [[15, 13], [16, 14]].map(([w, e]) => ({ wrist: [p[w].x, p[w].y], elbow: [p[e].x, p[e].y], vis: Math.min(p[w].visibility ?? 1, p[e].visibility ?? 1) }));
+    if (p) handlePose([[15, 13], [16, 14]].map(([w, e]) => ({ wrist: [p[w].x, p[w].y], elbow: [p[e].x, p[e].y], vis: Math.min(p[w].visibility ?? 1, p[e].visibility ?? 1) })), ts);
   }
-  handleResult(ts, hands, pose, performance.now() - t0);
 }
-function handleResult(ts, hands, pose, cost) {
-  const map = coverMap(innerWidth, innerHeight, det.vw, det.vh);
-  const arms = pose && pose.map(a => ({ wrist: [map.x(a.wrist[0]), map.y(a.wrist[1])], elbow: [map.x(a.elbow[0]), map.y(a.elbow[1])], vis: a.vis }));
-  tracker.ingest({ ts, hands, arms }, map, performance.now());
+function handleResult(ts, hands, cost) {
+  tracker.ingest({ ts, hands }, coverMap(innerWidth, innerHeight, det.vw, det.vh), performance.now());
   det.cost += (cost - det.cost) * .1;
   det.latency += (performance.now() - ts - det.latency) * .1;
   det.count++;
+}
+function handlePose(arms, ts) {
+  const map = coverMap(innerWidth, innerHeight, det.vw, det.vh);
+  tracker.ingestArms(arms.map(a => ({ wrist: [map.x(a.wrist[0]), map.y(a.wrist[1])], elbow: [map.x(a.elbow[0]), map.y(a.elbow[1])], vis: a.vis })), ts);
 }
 if (USE_CAM && location.protocol !== 'file:') startCamera(); else video.style.display = 'none';
 
@@ -706,7 +745,7 @@ setTimeout(() => { $('tip').style.opacity = 0; }, 10000);
 
 // ---------- 自动化测试用 ----------
 window.__timespell = () => ({ t: ia.t, tTarget: ia.target, locked: rigs.some(r => r.locked), fps, camOk, handStatus,
-  detector: { mode: det.mode, delegate: det.delegate, pose: det.pose, rate: det.rate, cost: det.cost, latency: det.latency, sent: det.sent, got: det.got, dropped: det.dropped, busy: det.busy },
+  detector: { mode: det.mode, delegate: det.delegate, pose: poseDet.ready || !!det.poser, rate: det.rate, cost: det.cost, latency: det.latency, sent: det.sent, got: det.got, dropped: det.dropped, busy: det.busy, readyMs: det.readyMs, gpuMs: det.gpuMs, poseMs: det.poseMs },
   hands: tracker.slots.filter(s => s.seen).length, presence: rigs[0].presence, audio: audio.on, tracks: audio.tracks, track: audio.track,
   lifeDeg: LIFE_DEG, dialAngle: ia.t * LIFE_RAD / 2, rings: rigs[0].rings.map(m => m.position.toArray().map(Math.round)) });
 window.__setTime = t => { ia.set(t); pushTime(ia.t, true); };

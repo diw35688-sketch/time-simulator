@@ -161,6 +161,12 @@ export class HandTracker {
     if (s.openRun >= p.openFrames) { s.open = want; s.openRun = 0; }
   }
 
+  // 手臂识别单独跑时，结果按位置分给当前看到的手
+  ingestArms(arms, ts) {
+    const slots = this.slots.filter(s => s.active && s.S);
+    if (slots.length) this.bindArms(arms, ts, slots);
+  }
+
   bindArms(arms, ts, slots) {
     for (const s of slots) {
       const w = s.S[0];

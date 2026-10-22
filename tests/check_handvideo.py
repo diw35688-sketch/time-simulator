@@ -23,23 +23,33 @@ async def run(p, key):
     pg.on('pageerror', lambda e: errs.append(str(e)[:160]))
     await pg.goto(f'{BASE}/index.html{query}')
     await pg.wait_for_function("window.__timespell && window.__timespell().handStatus.startsWith('就绪')", timeout=90000)
-    # GPU 预热完成前先等一会儿，再对齐到视频里“手出现”的那一刻
-    await pg.wait_for_timeout(12000 if key == 'auto' else 3000)
-    await pg.wait_for_function('window.__timespell().hands === 0', timeout=30000, polling=20)
+    # 自动模式要等 GPU 和手臂识别都预热好（第一次打开要二三十秒），再对齐到视频里“手出现”的那一刻
+    if key == 'auto':
+        await pg.wait_for_function("window.__timespell().handStatus.includes('手臂')", timeout=90000)
+    await pg.wait_for_timeout(3000)
+    # 视频里有 2.5 秒没有手，连续 1.2 秒看不到手才算到了这段空档，避免识别中途丢一下手就误对齐
+    await pg.wait_for_function("""(() => { const w = window; if (w.__timespell().hands > 0) { w.__noHand = 0; return false; }
+      w.__noHand = w.__noHand || performance.now(); return performance.now() - w.__noHand > 1200; })()""", timeout=60000, polling=50)
     await pg.wait_for_function('window.__timespell().hands >= 1', timeout=30000, polling=20)
+    got0 = await pg.evaluate('window.__timespell().detector.got')
     await pg.evaluate('window.__setTime(0); window.__timespellTest.resetPerf(); window.__timespellTest.record()')
     await pg.wait_for_timeout(13200)
     rows = await pg.evaluate('window.__timespellTest.stop()')
     pathlib.Path(tempfile.gettempdir(), f'timesim-rows-{key}.json').write_text(json.dumps(rows), encoding='utf8')
     perf = await pg.evaluate('window.__timespellTest.perf()')
     st = await pg.evaluate('window.__timespell()')
+    st['avgRate'] = (st['detector']['got'] - got0) / 13.2 if st['detector']['mode'] == 'worker' else None
     await b.close()
+    return analyze(name, rows, perf, st, errs)
+
+
+def analyze(name, rows, perf, st, errs):
     win = lambda k: [f for f in rows if WINDOWS[k][0] <= f['r'] < WINDOWS[k][1]]
     still = [f['rigs'][0] for f in win('still')]
     mx, my = statistics.mean(p['x'] for p in still), statistics.mean(p['y'] for p in still)
     tmean = lambda k: statistics.mean(f['t'] for f in win(k))
     return {
-        'name': name, 'status': st['handStatus'], 'rate': st['detector']['rate'], 'cost': st['detector']['cost'], 'latency': st['detector']['latency'],
+        'name': name, 'status': st['handStatus'], 'rate': st.get('avgRate') or st['detector']['rate'], 'cost': st['detector']['cost'], 'latency': st['detector']['latency'],
         'p50': perf['p50'], 'p95': perf['p95'], 'p99': perf['p99'], 'over25': perf['over25'], 'frames': perf['n'], 'longTasks': perf['longTasks'],
         'jitter': (statistics.mean((p['x'] - mx) ** 2 + (p['y'] - my) ** 2 for p in still)) ** .5,
         'lockA': any(f['rigs'][0]['locked'] for f in win('lockA')), 'lockO': all(f['rigs'][0]['locked'] for f in win('lockO')),
@@ -54,7 +64,11 @@ async def main():
     keys = [k for k in sys.argv[1:] if k in CONFIGS] or list(CONFIGS)
     async with async_playwright() as p:
         res = [await run(p, k) for k in keys]
-    rowsdef = [('status', '识别状态', str), ('rate', '识别次数/秒', '{:.1f}'), ('cost', '单帧识别耗时 ms', '{:.0f}'), ('latency', '采集到结果的延迟 ms', '{:.0f}'),
+    report(res)
+
+
+def report(res):
+    rowsdef = [('status', '识别状态', str), ('rate', '识别次数/秒（全程平均）', '{:.1f}'), ('cost', '单帧识别耗时 ms', '{:.0f}'), ('latency', '采集到结果的延迟 ms', '{:.0f}'),
                ('p50', '画面帧间隔中位数 ms', '{:.1f}'), ('p95', '帧间隔 95% 分位 ms', '{:.1f}'), ('p99', '帧间隔 99% 分位 ms', '{:.1f}'),
                ('over25', '超过 25ms 的卡顿帧', '{}'), ('longTasks', '主线程长任务（>50ms）', '{}'), ('jitter', '手静止时法阵抖动 px', '{:.2f}'),
                ('lockA', '离物品远时误锁定', '{}'), ('lockO', '手在物品上时一直锁定', '{}'),
@@ -65,4 +79,5 @@ async def main():
         print(label.ljust(22, '　'), ' | '.join(c.ljust(18) for c in cells))
     print(json.dumps([r['name'] for r in res], ensure_ascii=False))
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())
