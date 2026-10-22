@@ -847,16 +847,16 @@ function frame(now) {
     const s = slots[k], hidden = r.presence < .02;
     if (s.seen) {
       const d = s.d;
-      Object.assign(r, { hand: true, want: s.open ? 1 : 0, x: d.x, y: d.y, roll: d.roll, key: s.epoch, handLen: d.len, n: d.n,
+      Object.assign(r, { hand: true, want: s.open ? 1 : 0, fist: !s.open, x: d.x, y: d.y, roll: d.roll, key: s.epoch, handLen: d.len, n: d.n,
         arm: d.arm, armLen: d.armLen, armTilt: d.armTilt, armOk: d.armOk, wx: d.wx, wy: d.wy });
       // 法阵大小跟着手掌在画面里的大小走：手往镜头前推就变大，往后撤就变小
       r.radius = clamp(d.len * 1.55, 40, minSide * .5);
     } else if (k === 0 && useMouse) {
       r.x = hidden ? mouse.x : approach(r.x, mouse.x, dt, .03); r.y = hidden ? mouse.y : approach(r.y, mouse.y, dt, .03);
       r.radius = minSide * .2; r.handLen = r.radius / 1.55;
-      Object.assign(r, { hand: false, want: 1, roll: 0, key: null, n: MOUSE_N, arm: MOUSE_ARM, armLen: r.handLen * 2.15, armTilt: .6, armOk: false,
+      Object.assign(r, { hand: false, want: 1, fist: false, roll: 0, key: null, n: MOUSE_N, arm: MOUSE_ARM, armLen: r.handLen * 2.15, armTilt: .6, armOk: false,
         wx: r.x + MOUSE_ARM[0] * r.handLen * .55, wy: r.y + MOUSE_ARM[1] * r.handLen * .55 });
-    } else { r.want = 0; r.key = null; }
+    } else { r.want = 0; r.key = null; r.fist = false; }
   });
   const res = ia.step(dt, rigs, mouse.wheel);
   mouse.wheel = 0;

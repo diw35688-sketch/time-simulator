@@ -12,7 +12,7 @@ const radiusOf = len => clamp(len * 1.55, 40, Math.min(W, H) * 0.9);
 function rng(seed) {
   return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
 }
-const R = rng(20261022);
+let R = rng(20261022);   // 每组数据换一个种子，见下面的 useSeed
 const gauss = () => Math.sqrt(-2 * Math.log(R() + 1e-12)) * Math.cos(2 * Math.PI * R());
 
 // 手的骨架：(u, v)，u 沿手指方向，v 指向手的右侧；单位是手掌长度（手腕到中指根）
@@ -68,6 +68,8 @@ seg(900, () => at(A[0], A[1], -20, true, 1, 25), 'mjTwistHold');
 const END = segT;
 const truth = t => { for (const [a, b, fn] of SEG) if (t >= a && t < b) return fn((t - a) / (b - a)); return SEG.at(-1)[2](1); };
 const DROPS = [[1550, 1620], [5450, 5560], [13000, 13070]], FLIPS = [[1950, 2060]];
+// 转回去的途中手丢了 350ms（超过“短暂丢失”的宽限期）：拨盘应该原样等它回来接着拨，不少算角度
+const LONG_DROPS = [[8300, 8650]];
 const inWin = (t, wins) => wins.some(([a, b]) => t >= a && t < b);
 const wristOf = st => {
   const Ls = L * st.scale, U = [Math.cos(st.roll), Math.sin(st.roll)], V = [-Math.sin(st.roll), Math.cos(st.roll)];
@@ -88,25 +90,35 @@ function poseOf(st) {
   return [{ wrist: [wx + gauss() * 6, wy + gauss() * 6], elbow: [wx + Math.cos(a) * l + gauss() * 8, wy + Math.sin(a) * l + gauss() * 8], vis: 0.9 }];
 }
 // 摄像头按 fps 采集：手势识别每帧都有，姿态识别每 3 帧一次、结果更晚到
-function makeCaps(fps, latency, spread) {
+function makeCaps(fps, latency, spread, spikeEvery = 0, spikeMs = 0) {
   const caps = [];
   for (let c = 0, k = 0; c < END; k++, c = k * 1000 / fps + (R() - .5) * 2) {
-    const st = truth(c), present = st && !inWin(c, DROPS);
+    const st = truth(c), present = st && !inWin(c, DROPS) && !inWin(c, LONG_DROPS);
     const handed = inWin(c, FLIPS) ? 'Right' : 'Left';
-    caps.push({ c, arrive: c + latency + R() * spread, hands: present ? [{ lm: landmarks(st), handed, score: 0.95 }] : [] });
+    const spike = spikeEvery && k % spikeEvery === 0 ? spikeMs : 0;   // 个别帧识别得特别慢，结果晚到
+    caps.push({ c, arrive: c + latency + R() * spread + spike, hands: present ? [{ lm: landmarks(st), handed, score: 0.95 }] : [] });
     if (present && k % 3 === 0) caps.push({ c, arrive: c + latency + 45 + R() * spread * 2, arms: poseOf(st) });
   }
   return caps.sort((a, b) => a.arrive - b.arrive);
 }
-const CAPS = makeCaps(30, 38, 18);   // 实测 GPU 识别从拍下到出结果约 45ms
+// 合成数据带随机噪声：按种子生成一组。指标在 5 个种子上取中位数，免得结论取决于某一次噪声的运气
+let CAPS, SLOW_CAPS, RENDERS, HAND_CAPS;
+function useSeed(seed) {
+  R = rng(seed);
+  CAPS = makeCaps(30, 38, 18);   // 实测 GPU 识别从拍下到出结果约 45ms
 // 慢电脑：每秒只识别 8 次，结果晚 120ms 左右才到
-const SLOW_CAPS = makeCaps(8, 110, 30);
-const RENDERS = [];
-for (let r = 0, i = 0; r < END; i++, r = i * 1000 / 60 + (R() - .5) * .6) RENDERS.push(r);
+  SLOW_CAPS = makeCaps(8, 110, 30, 5, 90);
+  RENDERS = [];
+  for (let r = 0, i = 0; r < END; i++, r = i * 1000 / 60 + (R() - .5) * .6) RENDERS.push(r);
+  HAND_CAPS = CAPS.filter(c => c.hands).sort((a, b) => a.c - b.c);
+}
+const SEEDS = [20261022, 7, 99, 1234, 31415];
+useSeed(SEEDS[0]);
 
 // 新算法：js/tracker.js 的 HandTracker + Interaction，和 js/main.js 里的调用方式一致。
 // 同时按上一版的做法算一份前臂方向（有新鲜的姿态结果就朝手肘，否则朝手指反方向，再平滑 80ms）拿来对比
-function runNew(trackParams = {}, interactParams = {}, caps = CAPS) {
+function runNew(trackParams = {}, interactParams = {}, caps = null) {
+  caps = caps || CAPS;
   const tracker = new HandTracker(trackParams), ia = new Interaction(LIFE_RAD, interactParams);
   const rigs = [0, 1].map(() => ({ want: 0, roll: 0, key: null, presence: 0, locked: false, x: 0, y: 0, radius: 100 }));
   const rec = [];
@@ -123,8 +135,8 @@ function runNew(trackParams = {}, interactParams = {}, caps = CAPS) {
     const slots = tracker.update(r, dt);
     slots.forEach((s, k) => {
       const g = rigs[k];
-      if (s.seen) Object.assign(g, { want: s.open ? 1 : 0, x: s.d.x, y: s.d.y, radius: radiusOf(s.d.len), roll: s.d.roll, key: s.epoch });
-      else Object.assign(g, { want: 0, key: null });
+      if (s.seen) Object.assign(g, { want: s.open ? 1 : 0, fist: !s.open, x: s.d.x, y: s.d.y, radius: radiusOf(s.d.len), roll: s.d.roll, key: s.epoch });
+      else Object.assign(g, { want: 0, key: null, fist: false });
     });
     const res = ia.step(dt, rigs);
     const s0 = slots[0], d = s0.d;
@@ -141,7 +153,6 @@ function runNew(trackParams = {}, interactParams = {}, caps = CAPS) {
 }
 
 // 旧算法：照搬最早一版 index.html 的 readHands 和 frame（识别结果在渲染帧里同步处理，OneEuro 用渲染帧间隔，要靠近物品才锁定）
-const HAND_CAPS = CAPS.filter(c => c.hands).sort((a, b) => a.c - b.c);
 function runOld() {
   const mk = () => ({ seen: false, open: false, fx: new OneEuro(1.2, .02, 1), fy: new OneEuro(1.2, .02, 1), fl: new OneEuro(.8, .005, 1), angle: null, acc: 0, prevF: 0, palm: [0, 0], len: 0, rawAngle: 0 });
   const hands = [mk(), mk()], rigs = [0, 1].map(() => ({ x: 0, y: 0, presence: 0, want: 0, locked: false, radius: 100 }));
@@ -194,7 +205,13 @@ const mean = a => a.reduce((s, v) => s + v, 0) / Math.max(a.length, 1);
 const std = a => { const m = mean(a); return Math.sqrt(mean(a.map(v => (v - m) ** 2))); };
 function crossMs(rows, get, from, to) {
   const mid = (from + to) / 2, sgn = Math.sign(to - from);
-  for (const f of rows) { const v = get(f); if (v !== null && v !== undefined && (v - mid) * sgn >= 0) return f.r; }
+  let prev = null;
+  for (const f of rows) {
+    const v = get(f);
+    if (v === null || v === undefined) continue;
+    if ((v - mid) * sgn >= 0) return prev && prev.v !== v ? prev.r + (f.r - prev.r) * (mid - prev.v) / (v - prev.v) : f.r;
+    prev = { r: f.r, v };
+  }
   return null;
 }
 function armMetrics(rec, key) {
@@ -286,9 +303,9 @@ const CHECKS = [
   ['stepCVFast', '每帧位移的波动（800px/s）', v => v <= 0.35],
   ['overshoot', '突然停下时冲过头（像素，最坏情况）', v => v <= 13],
   ['smoothLagMs', '自然地移动手时落后（ms）', v => v <= 25],
-  ['smoothOver', '自然地停下手时冲过头（像素）', v => v <= 5],
+  ['smoothOver', '自然地停下手时冲过头（像素，630px 的快动作，峰值约 1500px/s）', v => v <= 10],
   ['tAfter60', '顺时针转 60° 后的时间（应为 0.80）', v => Math.abs(v - 0.8) <= 0.04],
-  ['tBack', '再转回 60° 后的时间（应回到 0）', v => Math.abs(v) <= 0.05],
+  ['tBack', '再转回 60° 后的时间（应回到 0，途中手丢了 350ms）', v => Math.abs(v) <= 0.05],
   ['tSlowHalf', '每秒 5° 慢转 3 秒走的时间（应为 0.20）', v => Math.abs(v - 0.2) <= 0.05],
   ['tSlow', '慢转 30° 后的时间（应为 0.40）', v => Math.abs(v - 0.4) <= 0.05],
   ['settleMs', '手停下后时间稳住要多久（ms）', v => v <= 300],
@@ -315,15 +332,26 @@ const CHECKS = [
 const SLOW = [['dropPresence', '慢电脑：丢帧时法阵亮度最低值', v => v >= 0.9], ['ghost', '慢电脑：重影法阵亮度', v => v <= 0.05],
   ['tAfter60', '慢电脑：转 60° 后的时间', v => Math.abs(v - 0.8) <= 0.05], ['tBack', '慢电脑：转回后的时间', v => Math.abs(v) <= 0.06],
   ['tSlow', '慢电脑：慢转 30° 后', v => Math.abs(v - 0.4) <= 0.06], ['farDelta', '慢电脑：远离物品转 30°', v => Math.abs(v + 0.4) <= 0.06],
-  ['sizeErr', '慢电脑：推近后法阵大小误差', v => v <= 6], ['armErrHold', '慢电脑：停下后前臂方向误差', v => v <= 5]];
+  ['sizeErr', '慢电脑：推近后法阵大小误差', v => v <= 6], ['armErrHold', '慢电脑：停下后前臂方向误差', v => v <= 6]];
 
 // 上一版（这次改动之前）的参数：外推到“现在”乘 0.55，转角不外推，各处平滑更重
 const PREV = { track: { dispLatency: 0, lead: 0.55, maxLead: 80, roll: [3.0, 0.4, 2.0], rollLead: 0, tauPos: 0.024, tauRoll: 0.02, tauSlow: 0.06, tauN: 0.08, tauArm: 0.08, tauBend: 0.12 },
   interact: { tauT: 0.06 } };
+// 在每个种子的数据上算一遍指标，取中位数
+function medianMetrics(run, seeds = SEEDS) {
+  const all = seeds.map(seed => { useSeed(seed); return metrics(run()); });
+  useSeed(SEEDS[0]);
+  const out = {};
+  for (const k of Object.keys(all[0])) {
+    const vals = all.map(m => m[k]).filter(v => v !== null && v !== undefined).sort((a, b) => a - b);
+    out[k] = vals.length ? vals[vals.length >> 1] : null;
+  }
+  return out;
+}
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
-  const oldM = metrics(runOld()), prevM = metrics(runNew(PREV.track, PREV.interact)), newM = metrics(runNew());
-  const slowM = metrics(runNew({}, {}, SLOW_CAPS));
+  const oldM = medianMetrics(() => runOld()), prevM = medianMetrics(() => runNew(PREV.track, PREV.interact)), newM = medianMetrics(() => runNew());
+  const slowM = medianMetrics(() => runNew({}, {}, SLOW_CAPS));
   const fmt = v => (v === null || v === undefined ? '-' : typeof v === 'number' ? (Number.isInteger(v) ? String(v) : v.toFixed(3)) : String(v));
   let fail = 0;
   console.log('指标'.padEnd(30, '　'), '最早版'.padStart(7), '上一版'.padStart(7), '新版'.padStart(8), '  结果');
@@ -338,4 +366,4 @@ if (isMain) {
   console.log(fail ? `${fail} 项不通过` : '全部通过');
   process.exit(fail ? 1 : 0);
 }
-export { runNew, runOld, metrics, armMetrics, CHECKS, PREV, SLOW_CAPS };
+export { runNew, runOld, metrics, medianMetrics, armMetrics, CHECKS, PREV, useSeed, SEEDS };

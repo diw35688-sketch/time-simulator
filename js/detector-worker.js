@@ -67,12 +67,13 @@ function detectHands(bitmap, ts) {
     else if (++H.miss >= 8) { H.both = false; H.miss = 0; }
     return r;
   }
-  const r = H.one.detectForVideo(bitmap, ts);
+  // 扫第二只手的那一帧只跑认两只手的那份（它也会给出这只手），这一帧不会比平时慢一倍
   if (H.two && ++H.n % H.scanEvery === 0) {
     const r2 = H.two.detectForVideo(bitmap, ts);
-    if ((r2.landmarks || []).length >= 2) { H.both = true; H.miss = 0; return r2; }
+    if ((r2.landmarks || []).length >= 2) { H.both = true; H.miss = 0; }
+    return r2;
   }
-  return r;
+  return H.one.detectForVideo(bitmap, ts);
 }
 
 function detect({ bitmap, ts }) {

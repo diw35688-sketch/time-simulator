@@ -104,7 +104,7 @@ export class HandTracker {
   }
 
   // 识别越慢、结果到得越晚，丢失后等待的时间越长：慢电脑上每次识别间隔可能有 100–200ms，不能当成手丢了
-  get grace() { return clamp(this.interval * 2.5 + this.latency, this.p.grace, 900); }
+  get grace() { return clamp(this.interval * 3 + this.latency * 1.5, this.p.grace, 900); }
   get resetMs() { return Math.max(this.p.reset, this.grace * 2); }
 
   // frame: { ts（采集时刻 ms）, hands: [{ lm, handed, score }], arms?: [{ wrist, elbow, vis }]（arms 已是屏幕像素） }
@@ -264,7 +264,7 @@ export class TimeDial {
   }
 }
 
-export const INTERACT_DEFAULTS = { tauT: 0.015, wheelStep: 0.001, backlash: 0.012 };
+export const INTERACT_DEFAULTS = { tauT: 0.015, wheelStep: 0.001, backlash: 0.012, holdS: 0.3 };
 
 // 法阵的出现和拨时间。rigs：每个法阵 { want（张开=1）, roll, key（手的槽位+跟踪纪元，鼠标为 null） }。
 // 张开手掌、法阵出来就能拨，不用靠近物品；两只手都张开时，先张开的那只说了算
@@ -272,7 +272,7 @@ export class Interaction {
   constructor(lifeRad, params = {}) {
     this.p = { ...INTERACT_DEFAULTS, ...params };
     this.dial = new TimeDial(lifeRad, this.p.backlash);
-    this.t = 0; this.target = 0; this.owner = -1;
+    this.t = 0; this.target = 0; this.owner = -1; this.lost = 0;
   }
   step(dt, rigs, wheel = 0) {
     const p = this.p;
@@ -281,9 +281,18 @@ export class Interaction {
       r.locked = r.presence > 0.5 && r.want === 1;
     }
     const drives = r => r && r.locked && r.want === 1 && r.key != null;
-    if (!drives(rigs[this.owner])) this.owner = rigs.findIndex(drives);
-    const o = rigs[this.owner], prevKey = this.dial.key, prevTarget = this.target, prevT = this.t;
-    this.target = this.dial.update(this.target, o ? o.roll : 0, o ? this.owner + ':' + o.key : null);
+    // 手短暂丢失（比如识别结果晚到了一点）时，拨盘原样等它回来：同一只手回来就接着拨，不从当前位置重新开始，
+    // 否则每丢一下就少算几度。握拳是主动松开拨盘，马上生效
+    const cur = rigs[this.owner];
+    if (drives(cur)) this.lost = 0;
+    else {
+      const other = rigs.findIndex((r, i) => i !== this.owner && drives(r));
+      if (other >= 0) { this.owner = other; this.lost = 0; }
+      else this.lost = cur && cur.fist ? Infinity : this.lost + dt;
+    }
+    const o = drives(rigs[this.owner]) ? rigs[this.owner] : null, prevKey = this.dial.key, prevTarget = this.target, prevT = this.t;
+    if (o) this.target = this.dial.update(this.target, o.roll, this.owner + ':' + o.key);
+    else if (this.lost > p.holdS) this.target = this.dial.update(this.target, 0, null);
     if (wheel && rigs.some(r => r.locked && r.key == null)) this.target = clamp(this.target + wheel * p.wheelStep, -1, 1);
     this.t = approach(this.t, this.target, dt, p.tauT);
     if (Math.abs(this.t - this.target) < 1e-4) this.t = this.target;
